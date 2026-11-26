@@ -74,9 +74,9 @@ try {
     await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
     for (const shot of SHOTS) {
       await send("Page.navigate", { url: BASE + shot.path });
-      // The cards' box once the page has drawn its data: the heading's card, or that card's row.
+      // The cards' box once the page has drawn its data and any scan settled: the heading's card, or that card's row.
       const rect = await until(`${shot.name} to draw`, () => evaluate(`(() => {
-        if (!document.querySelector(".card h2")) return null;
+        if (!document.querySelector(".card h2") || document.querySelector(".refresh.busy")) return null;
         const h = ${JSON.stringify(shot.heading ?? "")};
         if (!h) return { x: 0, y: 0, width: ${WIDTH}, height: ${HEIGHT} };
         const h2 = [...document.querySelectorAll(".card h2")].find((e) => e.textContent.trim().startsWith(h));

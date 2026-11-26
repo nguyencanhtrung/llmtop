@@ -1,10 +1,11 @@
-// `make demo`: ten weeks of made-up Claude Code use in a temp folder, scanned and served, for screenshots and trying
-// the dashboard without real transcripts. The same seed gives the same data, dated back from today.
+// `make demo`: ten weeks of made-up multi-provider use (Claude Code, Codex and Antigravity) in a temp folder,
+// scanned and served, for screenshots and trying the dashboard without real transcripts. The same seed gives the same data, dated back from today.
 import { spawnSync, spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { priceAt, readPrices, requestCost } from "../../src/prices.mjs";
 import { assistant, compaction, cost, sid, user, writeTranscript } from "./build.mjs";
 
@@ -59,9 +60,23 @@ function withSkills(recs, cwd) {
 
 const home = mkdtempSync(join(tmpdir(), "llmtop-demo-"));
 const transcripts = join(home, "projects");
+const codexRoot = join(home, "codex");
+const codexSessions = join(codexRoot, "sessions");
+const agyRoot = join(home, "agy");
+mkdirSync(codexSessions, { recursive: true });
+mkdirSync(join(agyRoot, "brain"), { recursive: true });
 const configPath = join(home, "llmtop.config.json");
-writeFileSync(configPath, JSON.stringify({ providers: { claude: { transcripts } }, data: join(home, "data"), port: PORT }));
+writeFileSync(configPath, JSON.stringify({
+  providers: {
+    claude: { transcripts },
+    codex: { transcripts: codexSessions },
+    agy: { transcripts: agyRoot },
+  },
+  data: join(home, "data"),
+  port: PORT,
+}));
 const prices = readPrices({ prices: join(ROOT, "prices.md") }).rows;
+const jsonl = (rows) => rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
 
 let k = 0, ids = 0;
 const msgId = () => `msg_demo_${++ids}`;
@@ -114,13 +129,231 @@ function thread({ t, model, effort, longCache, turns, cwd, owner, onTask }) {
   return { recs, t, usage, api, tool, edits };
 }
 
+const CODEX_TOOLS = [["exec", 42], ["read_file", 24], ["apply_patch", 20], ["grep", 14]];
+const AGY_TOOLS = [["run_command", 34], ["read_file", 30], ["edit_file", 24], ["grep_search", 12]];
+const AGY_SUB_AGENTS = [["research", 60], ["self", 40]];
+const codexIndex = [];
+const agySummaries = [];
+
+function writeCodexRollout(sessionId, ts, rows) {
+  const iso = new Date(ts).toISOString();
+  const dir = join(codexSessions, iso.slice(0, 4), iso.slice(5, 7), iso.slice(8, 10));
+  mkdirSync(dir, { recursive: true });
+  const stamp = iso.slice(0, 19).replace(/:/g, "-");
+  writeFileSync(join(dir, `rollout-${stamp}-${sessionId}.jsonl`), jsonl(rows));
+}
+
+function buildCodexSession(startMs, cwd, title) {
+  const session = sid(++k);
+  const model = pick([["gpt-6.2-sol", 56], ["gpt-6.2-astra", 24], ["gpt-6-luna", 20]]);
+  const levels = [pick([["high", 55], ["xhigh", 25], ["medium", 20]]), pick([["xhigh", 45], ["high", 35], ["medium", 20]])];
+  const switchAt = rnd() < 0.15 ? int(2, 5) : Infinity;
+  const rows = [{ timestamp: new Date(startMs).toISOString(), type: "session_meta", payload: { id: session, cwd, timestamp: new Date(startMs).toISOString() } }];
+  let t = startMs + 1000, ctx = 0, last = null, callSeq = 0, respSeq = 0;
+  const turns = int(3, 12);
+  let curEffort = "";
+
+  const pushSubagent = (t0, role) => {
+    const subId = sid(++k);
+    const subModel = role === "Explore" ? pick([["gpt-6-luna", 65], ["gpt-6.2-sol", 35]]) : pick([["gpt-6.2-sol", 75], ["gpt-6.2-astra", 25]]);
+    const subRows = [
+      { timestamp: new Date(t0).toISOString(), type: "session_meta", payload: { id: subId, parent_thread_id: session, source: { subagent: { other: role } }, cwd } },
+      { timestamp: new Date(t0 + 500).toISOString(), type: "turn_context", payload: { model: subModel, effort: "medium", cwd } },
+      { timestamp: new Date(t0 + 1000).toISOString(), type: "event_msg", payload: { type: "task_started" } },
+    ];
+    let st = t0 + 1500, sctx = 0;
+    const subSteps = int(1, 3);
+    for (let s = 0; s < subSteps; s++) {
+      const uncached = s === 0 ? int(20000, 26000) : int(600, 1800);
+      const out = int(150, 900);
+      st += Math.max(1500, Math.round(out / 0.08));
+      subRows.push({
+        timestamp: new Date(st).toISOString(),
+        type: "token_usage_record",
+        payload: {
+          response_id: `sub_resp_${++ids}`,
+          usage: { input_tokens: uncached + sctx, cached_input_tokens: sctx, cache_write_input_tokens: 0, output_tokens: out, reasoning_output_tokens: Math.round(out * 0.25) },
+        },
+      });
+      sctx += uncached;
+    }
+    subRows.push({ timestamp: new Date(st + 200).toISOString(), type: "event_msg", payload: { type: "task_complete", duration_ms: st - t0 } });
+    writeCodexRollout(subId, t0, subRows);
+    return st - t0;
+  };
+
+  for (let turn = 0; turn < turns; turn++) {
+    if (turn) t += pick([[int(25, 210), 84], [int(380, 780), 9], [int(1200, 2600), 2], [int(4200, 9600), 5]]) * 1000;
+    const effort = turn >= switchAt ? levels[1] : levels[0];
+    if (effort !== curEffort) {
+      rows.push({ timestamp: new Date(t).toISOString(), type: "turn_context", payload: { model, effort, cwd } });
+      curEffort = effort;
+      t += 500;
+    }
+    const turnStart = t;
+    rows.push({ timestamp: new Date(t).toISOString(), type: "event_msg", payload: { type: "task_started" } });
+    rows.push({ timestamp: new Date(t + 200).toISOString(), type: "event_msg", payload: { type: "user_message", message: turn ? "Continue with the next step" : title } });
+    t += 1000;
+    const steps = int(2, 6);
+    for (let s = 0; s < steps; s++) {
+      if (ctx > 140000) {
+        ctx = int(20000, 32000); last = null;
+        rows.push({ timestamp: new Date(t).toISOString(), type: "compacted", payload: { message: "" } });
+        t += int(20, 60) * 1000;
+      }
+      const grow = int(700, 2800), rebuild = last === null || t - last > 300e3 || rnd() < 0.006;
+      const uncached = rebuild ? Math.max(21000, ctx + grow) : grow;
+      const cached = rebuild ? 0 : ctx;
+      ctx = uncached + cached;
+      const out = int(180, 2200), apiMs = Math.max(1500, Math.round(out / (0.065 + rnd() * 0.03)));
+      t += apiMs;
+      rows.push({
+        timestamp: new Date(t).toISOString(),
+        type: "token_usage_record",
+        payload: {
+          response_id: `resp_${session.slice(0, 8)}_${++respSeq}`,
+          usage: { input_tokens: uncached + cached, cached_input_tokens: cached, cache_write_input_tokens: 0, output_tokens: out, reasoning_output_tokens: Math.round(out * (0.2 + rnd() * 0.35)) },
+        },
+      });
+      last = t;
+      if (s < steps - 1) {
+        const name = pick(CODEX_TOOLS), callId = `call_${session.slice(0, 8)}_${++callSeq}`;
+        const failed = rnd() < 0.03;
+        const toolMs = int(1, 14) * 1000;
+        if (name === "apply_patch") {
+          const added = int(4, 28), removed = int(1, 12);
+          rows.push({ timestamp: new Date(t + 200).toISOString(), type: "response_item", payload: { type: "custom_tool_call", name, call_id: callId, input: "" } });
+          if (!failed) {
+            rows.push({
+              timestamp: new Date(t + toolMs).toISOString(),
+              type: "event_msg",
+              payload: { type: "item_completed", item: { type: "FileChange", status: "completed", changes: { "src/app.ts": { type: "add", content: "x\n".repeat(added) }, "src/old.ts": { type: "delete", content: "y\n".repeat(removed) } } } },
+            });
+          }
+          rows.push({
+            timestamp: new Date(t + toolMs).toISOString(),
+            type: "response_item",
+            payload: { type: "custom_tool_call_output", call_id: callId, output: [{ type: "input_text", text: `${failed ? "Script failed" : "Script completed"}\nWall time ${(toolMs / 1000).toFixed(1)} seconds` }] },
+          });
+        } else {
+          rows.push({ timestamp: new Date(t + 200).toISOString(), type: "response_item", payload: { type: "function_call", name, call_id: callId, arguments: "{}" } });
+          rows.push({
+            timestamp: new Date(t + toolMs).toISOString(),
+            type: "response_item",
+            payload: { type: "function_call_output", call_id: callId, output: [{ type: "input_text", text: `${failed ? "Exit code: 1\nfailed" : "Script completed"}\nWall time ${(toolMs / 1000).toFixed(1)} seconds\nOutput:\nok` }] },
+          });
+          if (!failed && rnd() < 0.14) t += pushSubagent(t + 500, pick(SUBS));
+        }
+        t += toolMs + 1000;
+      }
+    }
+    rows.push({ timestamp: new Date(t).toISOString(), type: "event_msg", payload: { type: "task_complete", duration_ms: t - turnStart } });
+  }
+  writeCodexRollout(session, startMs, rows);
+  codexIndex.push({ id: session, thread_name: title, updated_at: new Date(t).toISOString() });
+}
+
+function buildAgySession(startMs, cwd, title) {
+  const convId = sid(++k);
+  const baseModel = pick([["gemini-4-neon", 68], ["gemini-4-hydrogen", 32]]);
+  const effort = pick([["high", 55], ["xhigh", 25], ["medium", 20]]);
+  const model = `${baseModel}-${effort}`;
+  const rows = [];
+  let t = startMs, ctx = 0, last = null, step = 0;
+  const uri = pathToFileURL(cwd).href;
+  const turns = int(3, 10);
+
+  const pushSubagent = (t0, agentName) => {
+    const subId = sid(++k);
+    const subModel = agentName === "research" ? "gemini-4-hydrogen-medium" : "gemini-4-neon-high";
+    const subRows = [];
+    let st = t0, sctx = 0;
+    const subSteps = int(2, 4);
+    for (let s = 0; s < subSteps; s++) {
+      const uncached = s === 0 ? int(20000, 25000) : int(600, 1500);
+      const out = int(120, 700);
+      st += Math.max(1500, Math.round(out / 0.085));
+      subRows.push({
+        step_index: s,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: new Date(st).toISOString(),
+        model: subModel,
+        input_tokens: uncached,
+        cache_read_tokens: sctx,
+        output_tokens: out,
+        tool_calls: s < subSteps - 1 ? [{ name: "read_file", args: {} }] : [],
+      });
+      sctx += uncached;
+    }
+    const dir = join(agyRoot, "brain", subId, ".system_generated", "logs");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "transcript.jsonl"), jsonl(subRows));
+    agySummaries.push({ id: subId, title: `${agentName} task`, uri, parent: convId, agent: agentName });
+  };
+
+  for (let turn = 0; turn < turns; turn++) {
+    if (turn) t += pick([[int(25, 190), 84], [int(380, 780), 9], [int(1200, 2400), 2], [int(4200, 8400), 5]]) * 1000;
+    rows.push({ step_index: step++, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", created_at: new Date(t).toISOString(), content: turn ? "Continue with the next step" : title });
+    const steps = int(2, 5);
+    for (let s = 0; s < steps; s++) {
+      const grow = int(650, 2400), rebuild = last === null || t - last > 300e3 || rnd() < 0.008;
+      const uncached = rebuild ? Math.max(21000, ctx + grow) : grow;
+      const cached = rebuild ? 0 : ctx;
+      ctx = uncached + cached;
+      const out = int(160, 1900), apiMs = Math.max(1500, Math.round(out / (0.075 + rnd() * 0.025)));
+      t += apiMs;
+      const toolCalls = [];
+      if (s < steps - 1) {
+        const name = pick(AGY_TOOLS);
+        if (name === "edit_file") {
+          const rm = int(1, 8), add = int(3, 18);
+          toolCalls.push({ name, args: { Target: JSON.stringify("line\n".repeat(rm).trim()), Replacement: JSON.stringify("next\n".repeat(add).trim()) } });
+        } else {
+          toolCalls.push({ name, args: {} });
+        }
+      }
+      rows.push({
+        step_index: step++,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: new Date(t).toISOString(),
+        model,
+        input_tokens: uncached,
+        cache_read_tokens: cached,
+        output_tokens: out,
+        tool_calls: toolCalls,
+      });
+      last = t;
+      if (toolCalls.length) {
+        t += int(1, 6) * 1000;
+        const failed = rnd() < 0.03;
+        rows.push({ step_index: step++, source: "SYSTEM", type: "GENERIC", status: failed ? "ERROR" : "DONE", created_at: new Date(t).toISOString(), content: failed ? "Command exited with code 1" : "ok" });
+        if (!failed && rnd() < 0.16) pushSubagent(t + 500, pick(AGY_SUB_AGENTS));
+      }
+    }
+  }
+  const dir = join(agyRoot, "brain", convId, ".system_generated", "logs");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "transcript.jsonl"), jsonl(rows));
+  agySummaries.push({ id: convId, title, uri, parent: "", agent: "" });
+}
+
 for (let d = DAYS - 1; d >= 0; d--) {
   const date = new Date(); date.setDate(date.getDate() - d);
   const weekend = date.getDay() === 0 || date.getDay() === 6, ramp = 0.35 + 0.65 * (1 - d / DAYS);
-  const sessions = Math.round((weekend ? int(0, 2) : int(2, 6)) * ramp + (rnd() < ramp ? 1 : 0));
+  const sessions = Math.round((weekend ? int(0, 2) : int(3, 7)) * ramp + (rnd() < ramp ? 1 : 0));
   for (let n = 0; n < sessions; n++) {
-    const project = pick(PROJECTS), cwd = `/work/${project}`, session = sid(++k), slug = `-work-${project}`;
+    const project = pick(PROJECTS), cwd = `/work/${project}`;
     const start = new Date(date); start.setHours(pick([[9, 2], [10, 4], [11, 4], [13, 2], [14, 4], [15, 4], [16, 3], [17, 2], [20, 1], [21, 2], [22, 1]]), int(0, 59), int(0, 59), 0);
+    const title = `${VERBS[int(0, VERBS.length - 1)]} ${THINGS[int(0, THINGS.length - 1)]}`;
+    const provider = pick([["claude", 52], ["codex", 32], ["agy", 16]]);
+    if (provider === "codex") { buildCodexSession(start.getTime(), cwd, title); continue; }
+    if (provider === "agy") { buildAgySession(start.getTime(), cwd, title); continue; }
+
+    const session = sid(++k), slug = `-work-${project}`;
     const main = MODELS[pick([["opus", 76], ["sonnet", 20], ["haiku", 4]])], levels = [pick([["high", 60], ["xhigh", 25], ["medium", 15]]), pick([["xhigh", 50], ["high", 30], ["low", 20]])];
     const switchAt = rnd() < 0.2 ? int(2, 8) : Infinity;
     let subTool = 0;
@@ -144,12 +377,20 @@ for (let d = DAYS - 1; d >= 0; d--) {
       for (const [key, v] of Object.entries(u)) h[key] = (h[key] ?? 0) + v;
       h.costUSD += (u.inputTokens * 0.1 + u.outputTokens * 0.5) / 1e6 + searches * 0.01;
     }
-    const title = `${VERBS[int(0, VERBS.length - 1)]} ${THINGS[int(0, THINGS.length - 1)]}`, total = Object.values(usageAll).reduce((n, u) => n + u.costUSD, 0);
+    const total = Object.values(usageAll).reduce((n, u) => n + u.costUSD, 0);
     const end = { ...cost(total, { startTime: start.getTime(), modelUsage: usageAll }), totalAPIDuration: Math.round((r.api + subTool) * 1000), totalToolDuration: Math.round(r.tool * 1000),
       totalLinesAdded: r.edits * int(15, 70), totalLinesRemoved: r.edits * int(2, 14), sessionId: session };
     writeTranscript(transcripts, slug, session, [...withSkills(r.recs, cwd), { type: "ai-title", aiTitle: title, sessionId: session }, end]);
   }
 }
+
+writeFileSync(join(codexRoot, "session_index.jsonl"), jsonl(codexIndex));
+const sumDb = new DatabaseSync(join(agyRoot, "conversation_summaries.db"));
+sumDb.exec("CREATE TABLE conversation_summaries(conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT, parent_conversation_id TEXT, agent_name TEXT);");
+sumDb.exec("CREATE TABLE conversation_parents(conversation_id TEXT PRIMARY KEY, parent_id TEXT);");
+const insSum = sumDb.prepare("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)");
+for (const s of agySummaries) insSum.run(s.id, s.title, JSON.stringify([s.uri]), s.parent, s.agent);
+sumDb.close();
 
 const env = { ...process.env, LLMTOP_CONFIG: configPath };
 spawnSync(process.execPath, [join(ROOT, "bin", "llmtop.mjs"), "scan"], { env, stdio: "inherit" });
