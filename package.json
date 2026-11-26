@@ -63,6 +63,8 @@
     "test": "node --test \"test/*.test.mjs\" \"dashboard/src/*.test.ts\""
   },
   "devDependencies": {
+    "@fontsource-variable/montserrat": "^5.3.0",
+    "@fontsource-variable/roboto-mono": "^5.3.0",
     "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
