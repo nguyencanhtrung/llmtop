@@ -1,0 +1,67 @@
+{
+  "name": "llmtop",
+  "direction": "D \u2014 donut o",
+  "fonts": {
+    "wordmark": "Roboto Mono",
+    "weights": {
+      "llm": 400,
+      "top": 700
+    },
+    "letterSpacingEm": -0.03,
+    "ui": "Montserrat"
+  },
+  "colors": {
+    "ink": "#1A1A1A",
+    "paper": "#F2F2F2",
+    "white": "#FFFFFF",
+    "black": "#000000",
+    "tileDark": "#1A1A1A",
+    "tileLight": "#F2F2F2",
+    "donutOnLight": [
+      "#1A1A1A",
+      "#3F3F3F",
+      "#7F7F7F",
+      "#D8D8D8"
+    ],
+    "donutOnDark": [
+      "#FFFFFF",
+      "#D8D8D8",
+      "#888888",
+      "#3F3F3F"
+    ]
+  },
+  "donut": {
+    "segments": [
+      0.38,
+      0.26,
+      0.16,
+      0.08
+    ],
+    "gap": 0.03,
+    "startAngle": "12 o'clock",
+    "direction": "clockwise",
+    "meaning": "share of usage across providers, largest first; the last segment is 'others' (e.g. local models)"
+  },
+  "mark": {
+    "grid": 64,
+    "cornerRadius": 14,
+    "ringRadius": 16,
+    "ringStroke": 8
+  },
+  "favicon": {
+    "segments": [
+      0.46,
+      0.28,
+      0.14
+    ],
+    "gap": 0.04,
+    "ringRadius": 17,
+    "ringStroke": 12
+  },
+  "clearSpace": "0.25 \u00d7 mark height on every side",
+  "minSize": {
+    "mark": "16px (use favicon.svg below 32px)",
+    "wordmark": "80px wide",
+    "lockup": "120px wide"
+  }
+}

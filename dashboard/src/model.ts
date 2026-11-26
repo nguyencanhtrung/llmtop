@@ -1,0 +1,255 @@
+// The rows from GET /api/data (built by src/dashboard.mjs) and the queries the views run.
+//   sessions  one row per session (project, title, start, durations and cost from the host's cost record,
+//             owner messages, compactions, lines changed) and its main-thread effort runs [effort, requests]
+//   facts     tokens and cost per session, day, hour, model, effort and main/subagent (from per-request usage)
+//   subagents one row per subagent (type, model, parent model, output tokens)
+//   tools     tool calls and errors per session
+//   skills    per session, each skill's [typed as a command, called by the agent, failed calls, last day used];
+//             skillSources says where each skill was loaded from
+//   compactions one row per compaction (see Compaction)
+//   context   per session, day, model and effort: the cost of reading the context by size and the replay (see Ctx)
+
+export type Run = [effort: number, requests: number];
+export type Session = {
+  id: string; pr?: number; p: number; title: string; day: string; hour: number; min: number; dur: number; api: number; tool: number;
+  owner: number; compact: number; la: number; lr: number; parent: number; subs: unknown[]; cost: number;
+  costState: "ok" | "unknown" | "incomplete" | "estimated"; out: number; runs: Run[];
+  // Models without a price row, and models whose host cost misses the price table, in this session.
+  unpriced: string[]; priceOff: string[];
+};
+// rb is null unless a request of the fact rebuilt the cache; else [count, rewritten tokens, extra cost] per cause in
+// CAUSES order, then the idle gaps from 5 to 15 minutes, from 15 to 60 minutes and over an hour (summed over the fact's requests).
+// k is null unless part of the fact's cost was priced; else that cost as [reading the context, writing the cache, output, web search].
+// sv is what the cache saved against sending the same tokens as input; tc and te count tool calls and failed ones;
+// ot counts the owner turns whose first request is in the fact.
+export type Fact = { s: number; d: string; h: number; m: number; sub: number; e: number; q: number; i: number; o: number; cr: number; cw: number; th: number; c: number; rb: number[] | null; k: number[] | null; sv: number; tc: number; te: number; ot: number };
+export type Subagent = { s: number; type: number; m: number; parent: number; o: number };
+type RawFact = [number, string, number, number, number, number, number, number, number, number, number, number, number, number[] | null, number[] | null, number, number, number, number];
+// A compaction: auto is 1, manual 0, unknown null; pre, post and kept are tokens of context before it, of its summary and of
+// the next request; next and turns count requests and owner turns up to the next one (null for the last), tail the requests
+// after the last one; sum is what its summary request cost (null when it cannot be priced), rb the rewrite after it.
+export type Compaction = { s: number; d: string; m: number; e: number; sub: number; auto: number | null; pre: number | null; post: number | null; wait: number | null;
+  kept: number | null; nth: number; next: number | null; turns: number | null; tail: number | null; sum: number | null; rb: number };
+type RawCompaction = [number, string, number, number, number, number | null, number | null, number | null, number | null, number | null, number, number | null, number | null, number | null, number | null, number];
+// b: the cost of reading the context per size bucket (edges in Payload), then a part the host charged with no request;
+// n: requests per bucket; r: per replay point (the points, then now) compactions, reading, compacting, rebuilds after idle.
+export type Ctx = { s: number; d: string; m: number; e: number; b: number[]; n: number[]; r: number[] | null };
+type RawCtx = [number, string, number, number, number[], number[], number[] | null];
+export type Payload = {
+  today: string; scanned: string; models: string[]; providers?: string[]; projects: string[]; types: string[]; efforts: string[]; transcripts: number;
+  sessions: Session[]; facts: RawFact[]; subagents: Subagent[]; tools: Record<string, [number, number]>[];
+  skills: Record<string, SkillUse>[]; skillSources: Record<string, SkillSource>;
+  compactions: RawCompaction[]; context: RawCtx[]; edges: number[]; points: number[]; fires: Record<number, number | null>;
+};
+export type SkillUse = [command: number, agent: number, errors: number, last: string];
+export const SKILL_SOURCES = ["project", "personal", "plugin", "builtin", "other"] as const;
+export type SkillSource = (typeof SKILL_SOURCES)[number];
+
+export type Model = ReturnType<typeof buildModel>;
+
+export const dayAdd = (day: string, n: number) => new Date(Date.parse(day + "T00:00:00Z") + n * 864e5).toISOString().slice(0, 10);
+export const days = (from: string, to: string) => { const out: string[] = []; for (let d = from; d <= to; d = dayAdd(d, 1)) out.push(d); return out; };
+
+export function buildModel(data: Payload) {
+  const facts: Fact[] = data.facts.map(([s, d, h, m, sub, e, q, i, o, cr, cw, th, c, rb, k, sv, tc, te, ot]) => ({ s, d, h, m, sub, e, q, i, o, cr, cw, th, c, rb, k, sv, tc, te, ot }));
+  const sumOut = (p: number) => facts.reduce((n, f) => n + (data.sessions[f.s].p === p ? f.o : 0), 0);
+  const projectRank = data.projects.map((_, i) => i).sort((a, b) => sumOut(b) - sumOut(a));
+  const modelColors: string[] = [];
+  let colorSlot = 0;
+  for (const name of data.models) {
+    if (name === "unknown") modelColors.push("c0");
+    else modelColors.push("c" + ((colorSlot++ % 16) + 1));
+  }
+  return {
+    today: data.today, scanned: data.scanned,
+    models: data.models, providers: data.providers ?? [], projects: data.projects, types: data.types,
+    // Levels low → max, then any other value seen as written; facts and runs hold an index into it.
+    efforts: data.efforts,
+    levels: data.efforts.map((_, e) => e).filter((e) => facts.some((f) => f.e === e)), // levels seen, low → max
+    first: facts.reduce((a, f) => (f.d < a ? f.d : a), data.today),
+    sessions: data.sessions, subagents: data.subagents, tools: data.tools, skills: data.skills, skillSources: data.skillSources, facts, projectRank,
+    compactions: (data.compactions ?? []).map(([s, d, m, e, sub, auto, pre, post, wait, kept, nth, next, turns, tail, sum, rb]): Compaction => ({ s, d, m, e, sub, auto, pre, post, wait, kept, nth, next, turns, tail, sum, rb })),
+    context: (data.context ?? []).map(([s, d, m, e, b, n, r]): Ctx => ({ s, d, m, e, b, n, r })),
+    edges: data.edges ?? [], points: data.points ?? [], fires: data.fires ?? {}, // per model, the context at which compaction fires now
+    pColor: (p: number) => { const r = projectRank.indexOf(p); return r < 5 ? "c" + (r + 1) : "c0"; },
+    mColor: (m: number) => modelColors[m] ?? "c0",
+    prColor: (pr: number) => (pr >= 0 && pr < 8 ? "c" + (pr + 1) : "c0"),
+  };
+}
+
+export type Filter = { from: string; to: string; provider: number; project: number; model: number; effort: number };
+export type Metric = "out" | "cost" | "sess";
+export type Split = "model" | "provider" | "kind";
+
+export function providerOptions(M: Model, provider: number): { models: number[]; projects: number[]; levels: number[] } {
+  if (provider < 0) return { models: M.models.map((_, i) => i), projects: M.projectRank, levels: M.levels };
+  const seenM = new Set<number>(), seenP = new Set<number>(), seenE = new Set<number>();
+  for (const f of M.facts) {
+    const s = M.sessions[f.s];
+    if ((s.pr ?? -1) !== provider) continue;
+    seenM.add(f.m);
+    seenP.add(s.p);
+    seenE.add(f.e);
+  }
+  return {
+    models: M.models.map((_, i) => i).filter((m) => seenM.has(m)),
+    projects: M.projectRank.filter((p) => seenP.has(p)),
+    levels: M.levels.filter((e) => seenE.has(e)),
+  };
+}
+
+export function slice(M: Model, f: Filter, from = f.from, to = f.to) {
+  return M.facts.filter((x) => x.d >= from && x.d <= to && (f.provider < 0 || (M.sessions[x.s].pr ?? -1) === f.provider) && (f.project < 0 || M.sessions[x.s].p === f.project) && (f.model < 0 || x.m === f.model) && (f.effort < 0 || x.e === f.effort));
+}
+
+// Compactions and context rows under the same filter as the facts.
+export const keep = (M: Model, f: Filter, from = f.from, to = f.to) => <T extends { s: number; d: string; m: number; e: number }>(x: T) =>
+  x.d >= from && x.d <= to && (f.provider < 0 || (M.sessions[x.s].pr ?? -1) === f.provider) && (f.project < 0 || M.sessions[x.s].p === f.project) && (f.model < 0 || x.m === f.model) && (f.effort < 0 || x.e === f.effort);
+
+export const CAUSES = ["start", "compaction", "idle", "other"] as const;
+const RB_IDLE = CAUSES.indexOf("idle") * 3, RB_GAPS = CAUSES.length * 3;
+export type Rebuilds = Record<(typeof CAUSES)[number], { n: number; tokens: number; extra: number }> & { gaps: number[] };
+// What the facts hold per rebuild cause, and the idle ones split by the time since the previous request.
+export function rebuilds(F: Fact[]): Rebuilds {
+  const v = new Array(RB_GAPS + 3).fill(0);
+  for (const f of F) if (f.rb) f.rb.forEach((x, i) => { v[i] += x; });
+  const at = (c: (typeof CAUSES)[number]) => { const i = CAUSES.indexOf(c) * 3; return { n: v[i], tokens: v[i + 1], extra: v[i + 2] }; };
+  return { start: at("start"), compaction: at("compaction"), idle: at("idle"), other: at("other"), gaps: v.slice(RB_GAPS) };
+}
+
+// A cost as [reading the context, writing the cache, output, what the price table cannot split]: the last part is a
+// model without a price row, or a cost the host charged without a request in the transcript; under 1% it is dropped.
+// A cost as reading the context, writing the cache, output, web search and the rest the price table cannot split.
+export function costParts(c: number, k: number[]) {
+  const rest = c - k.reduce((a, b) => a + b, 0);
+  return [...k, rest > c * 0.01 ? rest : 0];
+}
+
+// Cost per day, or per hour when list holds hours, split as costParts splits it.
+export function byDayKinds(F: Fact[], list: (string | number)[]) {
+  const slot = typeof list[0] === "number" ? (f: Fact) => f.h : (f: Fact) => f.d;
+  const idx = new Map<string | number, number>(list.map((d, i) => [d, i]));
+  const rows = list.map(() => [0, 0, 0, 0, 0]);
+  for (const f of F) {
+    const i = idx.get(slot(f));
+    if (i === undefined) continue;
+    const k = f.k ?? [0, 0, 0, 0];
+    for (let j = 0; j < 4; j++) rows[i][j] += k[j];
+    rows[i][4] += f.c - k[0] - k[1] - k[2] - k[3];
+  }
+  // A rounding remainder is not a part of its own.
+  for (const r of rows) if (r[4] < r.reduce((a, b) => a + b, 0) * 0.01) r[4] = 0;
+  return rows;
+}
+
+export type Totals = ReturnType<typeof totals>;
+export function totals(M: Model, F: Fact[]) {
+  const a = { o: 0, c: 0, i: 0, cr: 0, cw: 0, q: 0, th: 0, sv: 0, n: 0, hit: 0, ctx: 0, tps: 0, k: [0, 0, 0, 0], sess: new Set<number>() };
+  for (const f of F) { a.o += f.o; a.c += f.c; a.i += f.i; a.cr += f.cr; a.cw += f.cw; a.q += f.q; a.th += f.th; a.sv += f.sv; a.sess.add(f.s); f.k?.forEach((x, j) => { a.k[j] += x; }); }
+  const ss = [...a.sess].map((s) => M.sessions[s]);
+  a.n = a.sess.size; a.hit = a.cr / (a.cr + a.cw + a.i || 1); a.ctx = context(a);
+  // Speed counts only sessions whose host record gives API time; a running session has none yet.
+  const timed = ss.filter((s) => s.api > 0);
+  a.tps = timed.reduce((n, s) => n + s.out, 0) / (timed.reduce((n, s) => n + s.api, 0) || 1);
+  return a;
+}
+
+const val = (metric: Metric, f: Fact) => (metric === "cost" ? f.c : f.o);
+export const HOURLY = Array.from({ length: 24 }, (_, h) => h);
+// A one-day window draws per-day charts by hour.
+export const slotsOf = (list: string[]): (string | number)[] => (list.length === 1 ? HOURLY : list);
+
+export function byDay(F: Fact[], list: (string | number)[], key: (f: Fact) => number, groups: unknown[], metric: Metric) {
+  const slot = typeof list[0] === "number" ? (f: Fact) => f.h : (f: Fact) => f.d;
+  const idx = new Map<string | number, number>(list.map((d, i) => [d, i]));
+  const rows = list.map(() => groups.map(() => 0)), seen = list.map(() => groups.map(() => new Set<number>()));
+  for (const f of F) { const i = idx.get(slot(f)), g = key(f); if (i === undefined || g < 0) continue; if (metric === "sess") seen[i][g].add(f.s); else rows[i][g] += val(metric, f); }
+  return metric === "sess" ? seen.map((r) => r.map((s) => s.size)) : rows;
+}
+
+export function group(F: Fact[], key: (f: Fact) => number, metric: Metric) {
+  const m = new Map<number, number | Set<number>>();
+  for (const f of F) {
+    const k = key(f);
+    if (metric === "sess") { if (!m.has(k)) m.set(k, new Set()); (m.get(k) as Set<number>).add(f.s); } else m.set(k, ((m.get(k) as number) || 0) + val(metric, f));
+  }
+  return new Map([...m].map(([k, v]) => [k, v instanceof Set ? v.size : v]));
+}
+
+// The context one request carries: what it read as input, from the cache or wrote to it.
+export const context = (a: { i: number; cr: number; cw: number; q: number }) => (a.q ? (a.i + a.cr + a.cw) / a.q : 0);
+
+export type SessionRow = { s: number; o: number; c: number; cr: number; cw: number; i: number; q: number; mix: number[]; subMix: number[]; lapses: number; x: Session; hit: number; ctx: number };
+export function sessionRows(M: Model, F: Fact[]): SessionRow[] {
+  const m = new Map<number, Omit<SessionRow, "x" | "hit" | "ctx">>();
+  for (const f of F) {
+    let r = m.get(f.s);
+    if (!r) m.set(f.s, (r = { s: f.s, o: 0, c: 0, cr: 0, cw: 0, i: 0, q: 0, mix: M.models.map(() => 0), subMix: M.models.map(() => 0), lapses: 0 }));
+    r.o += f.o; r.c += f.c; r.cr += f.cr; r.cw += f.cw; r.i += f.i; r.q += f.q; r.mix[f.m] += f.o; if (f.sub) r.subMix[f.m] += f.o;
+    if (f.rb) r.lapses += f.rb[RB_IDLE];
+  }
+  return [...m.values()].map((r) => ({ ...r, x: M.sessions[r.s], hit: r.cr / (r.cr + r.cw + r.i || 1), ctx: context(r) }));
+}
+
+// Tool calls and errors summed over sessions, most called first.
+export function toolCalls(M: Model, sessions: number[]) {
+  const by = new Map<string, [number, number]>();
+  sessions.forEach((s) => Object.entries(M.tools[s]).forEach(([n, [c, e]]) => { const r = by.get(n) ?? [0, 0]; r[0] += c; r[1] += e; by.set(n, r); }));
+  return [...by].sort((a, b) => b[1][0] - a[1][0]);
+}
+
+export type SkillRow = { name: string; source: SkillSource; command: number; agent: number; errors: number; sessions: number; last: string };
+// Skills summed over sessions, by source and then most used first; the same rows as `usage --by skill`.
+export function skillUses(M: Model, sessions: number[]): SkillRow[] {
+  const by = new Map<string, SkillRow>();
+  sessions.forEach((s) => Object.entries(M.skills[s]).forEach(([name, [c, a, e, last]]) => {
+    const r = by.get(name) ?? { name, source: M.skillSources[name], command: 0, agent: 0, errors: 0, sessions: 0, last: "" };
+    r.command += c; r.agent += a; r.errors += e; r.sessions++; if (last > r.last) r.last = last;
+    by.set(name, r);
+  }));
+  const uses = (r: SkillRow) => r.command + r.agent;
+  return [...by.values()].sort((a, b) => SKILL_SOURCES.indexOf(a.source) - SKILL_SOURCES.indexOf(b.source) || uses(b) - uses(a) || a.name.localeCompare(b.name));
+}
+
+// Output per request at level e against level `high` on model m, within the same work: each session's main thread
+// and its subagents apart, where both levels ran at least 5 requests; the median of those ratios, so no long session
+// outweighs the rest, and only when 3 sessions or more have both. n counts those sessions.
+export function vsHigh(F: Fact[], m: number, e: number, high: number): { r: number | null; n: number } {
+  const by = new Map<string, { s: number; q: number[]; o: number[] }>();
+  for (const f of F) {
+    if (f.m !== m || (f.e !== e && f.e !== high)) continue;
+    const key = `${f.s}|${f.sub}`, u = by.get(key) ?? by.set(key, { s: f.s, q: [0, 0], o: [0, 0] }).get(key)!, j = f.e === e ? 0 : 1;
+    u.q[j] += f.q; u.o[j] += f.o;
+  }
+  const pairs = [...by.values()].filter((u) => u.q[0] >= 5 && u.q[1] >= 5 && u.o[1] > 0);
+  const n = new Set(pairs.map((u) => u.s)).size;
+  if (n < 3) return { r: null, n };
+  const ratios = pairs.map((u) => u.o[0] / u.q[0] / (u.o[1] / u.q[1])).sort((a, b) => a - b), mid = ratios.length >> 1;
+  return { r: ratios.length % 2 ? ratios[mid] : (ratios[mid - 1] + ratios[mid]) / 2, n };
+}
+
+// How each model works, from the facts in the window: output per request, the thinking share of output, main-thread
+// requests per owner turn, tool calls per request and the failed share of them, and output speed. A figure needs a base
+// of at least BASE requests, turns or calls, else it is null. Speed counts sessions that ran only this model, subagents
+// included, since the host gives API time per session; it needs at least 3 such sessions.
+export const BASE = 20;
+export type Behavior = { m: number; q: number; main: number; turns: number; calls: number; timed: number; out: number | null; think: number | null; steps: number | null; tools: number | null; fail: number | null; tps: number | null };
+export function behavior(M: Model, F: Fact[]): Behavior[] {
+  const only = new Map<number, number>(); // session → its one model, or -1 when it ran several
+  for (const f of M.facts) { const m = only.get(f.s); only.set(f.s, m === undefined || m === f.m ? f.m : -1); }
+  const sessions = new Set(F.map((f) => f.s));
+  return M.models.map((_, m) => {
+    const x = F.filter((f) => f.m === m), sum = (k: (f: Fact) => number) => x.reduce((n, f) => n + k(f), 0);
+    const q = sum((f) => f.q), main = sum((f) => (f.sub ? 0 : f.q)), o = sum((f) => f.o), turns = sum((f) => f.ot), calls = sum((f) => f.tc);
+    const timed = [...sessions].filter((s) => only.get(s) === m).map((s) => M.sessions[s]).filter((s) => s.api > 0);
+    const api = timed.reduce((n, s) => n + s.api, 0);
+    return {
+      m, q, main, turns, calls, timed: timed.length,
+      out: q >= BASE ? o / q : null, think: q >= BASE && o ? sum((f) => f.th) / o : null,
+      steps: turns >= BASE ? main / turns : null, tools: q >= BASE ? calls / q : null,
+      fail: calls >= BASE ? sum((f) => f.te) / calls : null, tps: timed.length >= 3 && api ? timed.reduce((n, s) => n + s.out, 0) / api : null,
+    };
+  }).filter((b) => b.q);
+}
+
+export const mainLevel = (runs: Run[]) => { const by = new Map<number, number>(); runs.forEach(([e, q]) => by.set(e, (by.get(e) || 0) + q)); return [...by].sort((a, b) => b[1] - a[1])[0][0]; };

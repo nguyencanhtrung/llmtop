@@ -1,0 +1,110 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { behavior, buildModel, byDayKinds, context, costParts, providerOptions, rebuilds, skillUses, vsHigh, type Fact, type Model, type Payload } from "./model.ts";
+import { parseUrl } from "./state.ts";
+
+const fact = (rb: number[] | null): Fact => ({ s: 0, d: "2026-11-01", h: 0, m: 0, sub: 0, e: 0, q: 1, i: 0, o: 0, cr: 0, cw: 0, th: 0, c: 0, rb, k: null, sv: 0, tc: 0, te: 0, ot: 0 });
+
+test("rebuilds sums the facts' vectors per cause and splits the idle ones by gap", () => {
+  // start, compaction, idle, other as [count, tokens, extra], then the three idle gap counts.
+  const a = [1, 100, 0.5, 0, 0, 0, 2, 300, 1.5, 0, 0, 0, 1, 0, 1];
+  const b = [0, 0, 0, 1, 50, 0.25, 0, 0, 0, 3, 90, 0.75, 0, 0, 0];
+  assert.deepEqual(rebuilds([fact(a), fact(null), fact(b)]), {
+    start: { n: 1, tokens: 100, extra: 0.5 }, compaction: { n: 1, tokens: 50, extra: 0.25 }, idle: { n: 2, tokens: 300, extra: 1.5 }, other: { n: 3, tokens: 90, extra: 0.75 }, gaps: [1, 0, 1],
+  });
+  assert.equal(rebuilds([]).idle.n, 0);
+});
+
+test("a sort the sessions table has no column for falls back to the start", () => {
+  for (const k of ["project", "tps", "subs", "lapses"]) assert.equal(parseUrl("/sessions", `sort=${k}`).sort, "start");
+  assert.equal(parseUrl("/sessions", "sort=ctx").sort, "ctx");
+});
+
+test("skillUses sums sessions per skill, listed by source and then most used", () => {
+  const M = {
+    skills: [{ review: [1, 2, 0, "2026-11-01"], pdf: [0, 1, 1, "2026-11-01"] }, { review: [0, 3, 0, "2026-11-03"], notes: [2, 0, 0, "2026-11-02"] }, { review: [9, 9, 0, "2026-11-04"] }],
+    skillSources: { review: "project", pdf: "plugin", notes: "personal" },
+  } as unknown as Model;
+  assert.deepEqual(skillUses(M, [0, 1]), [
+    { name: "review", source: "project", command: 1, agent: 5, errors: 0, sessions: 2, last: "2026-11-03" },
+    { name: "notes", source: "personal", command: 2, agent: 0, errors: 0, sessions: 1, last: "2026-11-02" },
+    { name: "pdf", source: "plugin", command: 0, agent: 1, errors: 1, sessions: 1, last: "2026-11-01" },
+  ]);
+});
+
+test("context per request counts input, cache reads and cache writes", () => {
+  assert.equal(context({ i: 10, cr: 900, cw: 90, q: 2 }), 500);
+  assert.equal(context({ i: 0, cr: 0, cw: 0, q: 0 }), 0);
+});
+
+test("cost parts keep what the table cannot split only when it is at least 1% of the cost", () => {
+  assert.deepEqual(costParts(10, [5, 2, 1, 0]), [5, 2, 1, 0, 2]);
+  assert.deepEqual(costParts(10, [4, 3, 1.95, 1]), [4, 3, 1.95, 1, 0]);
+});
+
+test("cost per day splits each fact's priced parts and puts the rest of its cost apart", () => {
+  const f = (d: string, c: number, k: number[] | null): Fact => ({ ...fact(null), d, c, k });
+  const rows = byDayKinds([f("2026-11-01", 4, [1, 1, 1, 1]), f("2026-11-01", 3, null), f("2026-11-02", 2, [1, 0.5, 0.5, 0])], ["2026-11-01", "2026-11-02"]);
+  assert.deepEqual(rows, [[1, 1, 1, 1, 3], [1, 0.5, 0.5, 0, 0]]);
+});
+
+test("effort against high compares the same sessions, as the median of their ratios", () => {
+  const f = (s: number, sub: number, e: number, q: number, o: number): Fact => ({ ...fact(null), s, sub, e, q, o });
+  // Sessions 0-2 ran medium (1) at half, 0.8 and 0.6 of their high (2); session 3 ran only medium, at a far higher
+  // output, and session 4 has too few medium requests: neither counts. Session 0's subagents are compared apart.
+  const F = [f(0, 0, 1, 10, 500), f(0, 0, 2, 10, 1000), f(1, 0, 1, 5, 400), f(1, 0, 2, 5, 500), f(2, 0, 1, 20, 1200), f(2, 0, 2, 20, 2000),
+    f(3, 0, 1, 50, 50000), f(4, 0, 1, 4, 100), f(4, 0, 2, 9, 900), f(0, 1, 1, 5, 5000), f(0, 1, 2, 4, 100)];
+  assert.deepEqual(vsHigh(F, 0, 1, 2), { r: 0.6, n: 3 });
+  assert.deepEqual(vsHigh(F.filter((x) => x.s !== 2), 0, 1, 2), { r: null, n: 2 });
+  assert.deepEqual(vsHigh(F, 1, 1, 2), { r: null, n: 0 });
+});
+
+test("how each model works needs a base for each figure, and speed only sessions that ran one model", () => {
+  const f = (s: number, m: number, sub: number, q: number, o: number, x: Partial<Fact> = {}): Fact => ({ ...fact(null), s, m, sub, q, o, ...x });
+  const session = (api: number, out: number) => ({ api, out });
+  // Model 0 runs sessions 0-2 alone; session 3 mixes it with model 1, so only model 0's sessions 0-2 give a speed.
+  const F = [f(0, 0, 0, 10, 1000, { th: 500, ot: 10, tc: 20, te: 2 }), f(0, 0, 1, 10, 500, { tc: 10 }), f(1, 0, 0, 5, 500, { ot: 5 }), f(2, 0, 0, 5, 500, { ot: 5 }),
+    f(3, 0, 0, 5, 100), f(3, 1, 1, 30, 300, { tc: 3 })];
+  const M = { models: ["a", "b"], facts: F, sessions: [session(10, 1500), session(5, 500), session(5, 500), session(20, 400)] } as unknown as Model;
+  const [a, b] = behavior(M, F);
+  assert.deepEqual(a, { m: 0, q: 35, main: 25, turns: 20, calls: 30, timed: 3, out: 2600 / 35, think: 500 / 2600, steps: 25 / 20, tools: 30 / 35, fail: 2 / 30, tps: 2500 / 20 });
+  assert.deepEqual(b, { m: 1, q: 30, main: 0, turns: 0, calls: 3, timed: 0, out: 10, think: 0, steps: null, tools: 0.1, fail: null, tps: null });
+});
+
+test("providerOptions scopes models, projects and effort levels to the chosen provider", () => {
+  const f = (s: number, m: number, e: number): Fact => ({ ...fact(null), s, m, e });
+  const M = {
+    models: ["Opus", "Sonnet", "GPT Sol", "Gemini Neon"],
+    providers: ["Claude", "Codex", "Antigravity"],
+    projectRank: [0, 1, 2],
+    levels: [0, 1, 2, 3],
+    sessions: [{ pr: 0, p: 0 }, { pr: 1, p: 1 }, { pr: 2, p: 2 }],
+    facts: [f(0, 0, 2), f(0, 1, 1), f(1, 2, 0), f(2, 3, 3)],
+  } as unknown as Model;
+  assert.deepEqual(providerOptions(M, -1), { models: [0, 1, 2, 3], projects: [0, 1, 2], levels: [0, 1, 2, 3] });
+  assert.deepEqual(providerOptions(M, 0), { models: [0, 1], projects: [0], levels: [1, 2] });
+  assert.deepEqual(providerOptions(M, 1), { models: [2], projects: [1], levels: [0] });
+  assert.deepEqual(providerOptions(M, 2), { models: [3], projects: [2], levels: [3] });
+});
+
+test("mColor assigns 16 distinct colors skipping unknown as c0", () => {
+  const models = [...Array.from({ length: 10 }, (_, i) => `M${i}`), "unknown", ...Array.from({ length: 7 }, (_, i) => `M${i + 10}`)];
+  const m = buildModel({
+    today: "2026-11-01",
+    scanned: "2026-11-01T00:00:00Z",
+    models,
+    projects: [],
+    types: [],
+    efforts: [],
+    sessions: [],
+    subagents: [],
+    tools: [],
+    skills: [],
+    skillSources: {},
+    facts: [],
+  } as unknown as Payload);
+  assert.equal(m.mColor(10), "c0");
+  const nonUnknown = models.map((_, i) => i).filter((i) => i !== 10).map((i) => m.mColor(i));
+  assert.deepEqual(nonUnknown.slice(0, 16), Array.from({ length: 16 }, (_, i) => `c${i + 1}`));
+  assert.equal(nonUnknown[16], "c1");
+});

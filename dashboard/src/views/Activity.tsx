@@ -1,0 +1,177 @@
+import { Fragment, useState, type ReactNode } from "react";
+import { useDash } from "../dash.ts";
+import { dayAdd, rebuilds, skillUses, slice, slotsOf, toolCalls, type Fact, type Model, type Session } from "../model.ts";
+import { ChartSeg, Columns, Delta, Empty, Heat, HeatSeg, Info, Kpi, Stats, tip } from "../ui.tsx";
+
+// What the agent did: time on the model and on tools, owner turns, lines, compactions and agent time per owner turn
+// against the window before; working time per day beside the hours of the week it fell in; lines per day; where the cache was rebuilt;
+// tool calls with their failed part beside the skills used.
+const work = (M: Model, F: Fact[]) => {
+  const ids = [...new Set(F.map((x) => x.s))], ss = ids.map((s) => M.sessions[s]), add = (k: (s: Session) => number) => ss.reduce((n, s) => n + k(s), 0);
+  return { ids, ss, api: add((s) => s.api), tool: add((s) => s.tool), idle: add((s) => Math.max(0, s.dur * 60 - s.api - s.tool)), owner: add((s) => s.owner), compact: add((s) => s.compact), la: add((s) => s.la), lr: add((s) => s.lr) };
+};
+
+// How long the agent worked, waiting for the model or running tools, for each owner turn.
+const perTurn = (w: { api: number; tool: number; owner: number }) => (w.owner ? (w.api + w.tool) / w.owner : 0);
+
+export function Activity({ F, list }: { F: Fact[]; list: string[] }) {
+  const { M, S, filter, t, f } = useDash();
+  const w = work(M, F), pf = dayAdd(filter.from, -list.length);
+  const p = pf >= M.first ? work(M, slice(M, filter, pf, dayAdd(filter.from, -1))) : null;
+  if (!w.ss.length) return <section className="card"><Empty /></section>;
+
+  // Per day by session start, or per hour in a one-day window.
+  const slots = slotsOf(list), hourly = slots !== list;
+  const at = (s: Session) => slots.indexOf(hourly ? s.hour : s.day);
+  const per = (k: (s: Session) => number) => { const out = slots.map(() => 0); w.ss.forEach((s) => { const i = at(s); if (i >= 0) out[i] += k(s); }); return out; };
+  const api = per((s) => s.api / 3600), tool = per((s) => s.tool / 3600), idle = per((s) => Math.max(0, s.dur * 60 - s.api - s.tool) / 3600);
+  const la = per((s) => s.la), lr = per((s) => s.lr);
+  const daily = (k: (s: Session) => number) => list.map((d) => w.ss.reduce((n, s) => n + (s.day === d ? k(s) : 0), 0));
+  const hours = (h: number) => (h >= 1 ? `${f.dec(h)}h` : `${Math.round(h * 60)}m`);
+  const kpi = (label: string, value: ReactNode, a: number, b: number | undefined, series: number[]) => (
+    <Kpi label={label} value={value} d={<Delta a={a} b={p ? b : undefined} side="none" />} series={series} />
+  );
+
+  return (
+    <div className="stack">
+      <div className="grid kpis">
+        {kpi(t("api"), f.dur(w.api / 60), w.api, p?.api, daily((s) => s.api))}
+        {kpi(t("tool"), f.dur(w.tool / 60), w.tool, p?.tool, daily((s) => s.tool))}
+        {kpi(t("ownerTurns"), f.int(w.owner), w.owner, p?.owner, daily((s) => s.owner))}
+        {kpi(t("linesAR"), <>{f.cmp(w.la)} <small>/ {f.cmp(w.lr)}</small></>, w.la + w.lr, p ? p.la + p.lr : undefined, daily((s) => s.la + s.lr))}
+        {kpi(t("compactions"), f.int(w.compact), w.compact, p?.compact, daily((s) => s.compact))}
+        {kpi(t("perTurn"), f.dur(perTurn(w) / 60), perTurn(w), p ? perTurn(p) : undefined, list.map((d) => { const ss = w.ss.filter((s) => s.day === d), o = ss.reduce((n, s) => n + s.owner, 0); return o ? ss.reduce((n, s) => n + s.api + s.tool, 0) / o : 0; }))}
+      </div>
+      <div className="grid half">
+        <section className="card">
+          <header><h2>{t("time")}</h2><div className="segs"><span className="hint">{t("idle")}: {f.dur(w.idle / 60)}</span><ChartSeg /></div></header>
+          <ul className="legend"><li><i className="c1" />{t("api")}<b>{f.dur(w.api / 60)}</b></li><li><i className="c3" />{t("tool")}<b>{f.dur(w.tool / 60)}</b></li></ul>
+          <Columns list={slots} rows={slots.map((_, i) => [api[i], tool[i]])} groups={[{ n: t("api"), c: "c1" }, { n: t("tool"), c: "c3" }]} metric="out" fmt={hours}
+            extra={(i) => (idle[i] ? [["c0", t("idle"), hours(idle[i])]] : [])} />
+        </section>
+        <section className="card"><header><h2>{t("hours")}</h2><HeatSeg /></header><Heat F={F} by={S.heat} /></section>
+      </div>
+      <section className="card">
+        <header><h2>{t("lines")}</h2><ChartSeg /></header>
+        <ul className="legend"><li><i className="c1" />{t("added")}<b>{f.cmp(w.la)}</b></li><li><i className="c4" />{t("removed")}<b>{f.cmp(w.lr)}</b></li></ul>
+        <Columns list={slots} rows={slots.map((_, i) => [la[i], lr[i]])} groups={[{ n: t("added"), c: "c1" }, { n: t("removed"), c: "c4" }]} metric="out" fmt={(v) => f.cmp(v)} />
+      </section>
+      <Rebuilds F={F} />
+      <div className="grid half">
+      <Tools ids={w.ids} />
+      <Skills ids={w.ids} />
+      </div>
+    </div>
+  );
+}
+
+const SHOWN = 12;
+
+// Tool calls, most used first, each with its failed part; the lead says how many failed and which tool most of them came
+// from. Past SHOWN rows the rest opens below.
+function Tools({ ids }: { ids: number[] }) {
+  const { M, t, L, f } = useDash();
+  const [all, setAll] = useState(false);
+  const rows = toolCalls(M, ids), shown = all ? rows : rows.slice(0, SHOWN);
+  const calls = rows.reduce((n, [, [c]]) => n + c, 0), errs = rows.reduce((n, [, [, e]]) => n + e, 0), tmax = Math.max(1, ...rows.map(([, [c]]) => c));
+  const worst = [...rows].sort((a, b) => b[1][1] - a[1][1])[0];
+  return (
+    <section className="card">
+      <header><h2>{t("tools")}</h2><span className="hint">{f.int(calls)} {t("calls")} · {f.int(rows.length)} {t("toolCount")}</span></header>
+      {errs ? <Stats items={[
+        { label: t("failed"), value: f.int(errs), tone: "err", sub: L.ofCalls(f.pct(errs / calls)) },
+        { label: L.fromTool(worst[0]), value: f.pct(worst[1][1] / errs), meter: [worst[1][1] / errs, "cneg"], sub: t("ofFailures") },
+      ]} /> : null}
+      {rows.length ? <div className="rank tools">{shown.map(([n, [c, e]]) => [
+        <span key={`n${n}`} className="n" title={n}>{n}</span>,
+        <span key={`t${n}`} className="t"><span className="b" style={{ width: `${(c / tmax) * 100}%` }} data-tip={tip(n, [["c1", t("calls"), f.int(c)], ["neg", t("errors"), f.int(e)]])}>{e ? <i style={{ width: `max(2px, ${(e / c) * 100}%)` }} /> : null}</span></span>,
+        <span key={`v${n}`} className="val">{f.int(c)}<small className={e ? "err" : ""}>{f.pct(e / c)} {t("errors")}</small></span>,
+      ])}</div> : <Empty />}
+      {rows.length > SHOWN ? <button type="button" className="disc more" aria-expanded={all} onClick={() => setAll(!all)}>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>{all ? t("showFewer") : `${t("seeAll")} (${rows.length})`}
+      </button> : null}
+    </section>
+  );
+}
+const SOURCE = { project: "srcProject", personal: "srcPersonal", plugin: "srcPlugin", builtin: "srcBuiltin", other: "srcOther" } as const;
+
+// Skills by where they were loaded from, most used first: each bar splits what the owner typed as a command from what the
+// agent called on its own, with its failed calls at the end. Past SHOWN rows the rest opens below.
+function Skills({ ids }: { ids: number[] }) {
+  const { M, t, f } = useDash();
+  const [all, setAll] = useState(false);
+  const rows = skillUses(M, ids), uses = rows.reduce((n, r) => n + r.command + r.agent, 0);
+  const top = new Set([...rows].sort((a, b) => b.command + b.agent - (a.command + a.agent)).slice(0, SHOWN).map((r) => r.name));
+  const shown = all ? rows : rows.filter((r) => top.has(r.name));
+  const max = Math.max(1, ...rows.map((r) => r.command + r.agent));
+  return (
+    <section className="card">
+      <header><h2>{t("skills")}</h2><span className="hint">{f.int(uses)} {t("uses")} · {f.int(rows.length)} {t("skillCount")}</span></header>
+      {rows.length ? <>
+        <ul className="legend"><li><i className="c1" />{t("skillTyped")}</li><li><i className="c3" />{t("skillAgent")}</li></ul>
+        <div className="rank tools">{shown.map((r, k) => {
+          const n = r.command + r.agent;
+          return <Fragment key={r.name}>
+            {k === 0 || shown[k - 1].source !== r.source ? <span className="grp">{t(SOURCE[r.source])}</span> : null}
+            <span className="n" title={r.name}>{r.name}</span>
+            <span className="t"><span className="b parts" style={{ width: `${(n / max) * 100}%` }} data-tip={tip(r.name, [["c1", t("skillTyped"), f.int(r.command)], ["c3", t("skillAgent"), f.int(r.agent)], ["neg", t("errors"), f.int(r.errors)], ["c0", t("lastUsed"), r.last ? f.dshort(r.last) : "—"]])}>
+              {r.command ? <b className="c1" style={{ width: `${(r.command / n) * 100}%` }} /> : null}
+              {r.agent ? <b className="c3" style={{ width: `${(r.agent / n) * 100}%` }} /> : null}
+              {r.errors ? <i style={{ width: `max(2px, ${(r.errors / n) * 100}%)` }} /> : null}
+            </span></span>
+            <span className="val">{f.int(n)}<small>{f.int(r.sessions)} {t("sess").toLowerCase()}</small></span>
+          </Fragment>;
+        })}</div>
+        {rows.length > SHOWN ? <button type="button" className="disc more" aria-expanded={all} onClick={() => setAll(!all)}>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>{all ? t("showFewer") : `${t("seeAll")} (${rows.length})`}
+        </button> : null}
+      </> : <Empty />}
+    </section>
+  );
+}
+
+// Where the prompt cache had to be written again: the four causes with their count, rewritten tokens and extra cost
+// over reading it; beside it, the idle ones by the time since the previous request.
+function Rebuilds({ F }: { F: Fact[] }) {
+  const { t, L, f } = useDash();
+  const r = rebuilds(F);
+  const rows = [["idle", t("rbIdle"), t("rbIdleTip")], ["compaction", t("rbCompaction"), t("rbCompactionTip")], ["other", t("rbOther"), t("rbOtherTip")], ["start", t("rbStart"), t("rbStartTip")]] as const;
+  const count = r.start.n + r.compaction.n + r.idle.n + r.other.n;
+  const gaps = [t("gapShort"), t("gapMid"), t("gapLong")], gmax = Math.max(1, ...r.gaps);
+  return (
+    <div className="grid half">
+      <section className="card">
+        <header>
+          <div className="ttl"><h2>{t("rebuilt")}</h2><Info label={t("howToRead")}>
+            <p>{t("rbInfo")}</p>
+            <ul>{rows.map(([c, label, def]) => <li key={c}><b>{label}</b>: {def}</li>)}</ul>
+          </Info></div>
+          <span className="hint">{f.int(count)}</span>
+        </header>
+        {count ? <div className="scroll"><table>
+          <thead><tr><th /><th className="num">{t("count")}</th><th className="num">{t("rbTokens")}</th><th className="num">{t("rbExtra")}</th></tr></thead>
+          <tbody>{rows.map(([c, label]) => (
+            <tr key={c}>
+              <th className="name">{label}</th>
+              <td className="num">{f.int(r[c].n)}</td>
+              <td className="num">{r[c].n ? f.cmp(r[c].tokens) : "—"}</td>
+              <td className="num">{c === "start" || !r[c].n ? "—" : f.usd(r[c].extra)}</td>
+            </tr>
+          ))}</tbody>
+        </table></div> : <Empty />}
+      </section>
+      <section className="card">
+        <header><h2>{t("idleGap")}</h2><span className="hint">{t("rbIdle")}: {f.int(r.idle.n)}</span></header>
+        {r.idle.n ? <Stats items={[
+          { label: t("perBreak"), value: f.usd(r.idle.extra / r.idle.n), sub: t("onAverage") },
+          { label: t("overHour"), value: f.pct(r.gaps[2] / r.idle.n), meter: [r.gaps[2] / r.idle.n, "c1"], sub: t("ofRebuilds") },
+        ]} /> : null}
+        {r.idle.n ? <div className="rank">{gaps.map((label, k) => [
+          <span key={`n${k}`} className="n">{label}</span>,
+          <span key={`t${k}`} className="t">{r.gaps[k] ? <span className="b" style={{ width: `${(r.gaps[k] / gmax) * 100}%` }} /> : null}</span>,
+          <span key={`v${k}`} className="val">{f.int(r.gaps[k])}</span>,
+        ])}</div> : <Empty />}
+      </section>
+    </div>
+  );
+}

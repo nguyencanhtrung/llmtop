@@ -1,0 +1,10 @@
+{
+  "providers": {
+    "claude": { "transcripts": "~/.claude/projects" },
+    "codex": { "transcripts": "~/.codex/sessions" },
+    "agy": { "transcripts": "~/.gemini/antigravity-cli" }
+  },
+  "data": "data",
+  "port": 4310,
+  "timeZone": "Europe/Berlin"
+}
