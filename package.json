@@ -1,6 +1,6 @@
 {
   "name": "llmtop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Local usage and cost analytics dashboard and CLI for Claude Code, Codex and Antigravity",
   "author": "Trung Nguyen",
@@ -29,7 +29,9 @@
   "publishConfig": {
     "access": "public"
   },
-  "engines": { "node": ">=22.15.0" },
+  "engines": {
+    "node": ">=22.15.0"
+  },
   "bin": {
     "llmtop": "./bin/llmtop.mjs"
   },
