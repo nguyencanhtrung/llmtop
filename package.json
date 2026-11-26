@@ -1,38 +1,72 @@
 {
   "name": "llmtop",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "A local dashboard and CLI for your LLM usage and cost",
+  "description": "Local usage and cost analytics dashboard and CLI for Claude Code, Codex and Antigravity",
+  "author": "Trung Nguyen",
   "license": "MIT",
-  "engines": { "node": ">=25" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nguyencanhtrung/llmtop.git"
+  },
+  "homepage": "https://github.com/nguyencanhtrung/llmtop#readme",
+  "bugs": {
+    "url": "https://github.com/nguyencanhtrung/llmtop/issues"
+  },
+  "keywords": [
+    "llm",
+    "claude-code",
+    "codex",
+    "antigravity",
+    "ai",
+    "usage",
+    "cost",
+    "analytics",
+    "dashboard",
+    "cli",
+    "sqlite"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": { "node": ">=22.15.0" },
   "bin": {
     "llmtop": "./bin/llmtop.mjs"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "dashboard/dist/",
+    "dashboard/src/",
+    "docs/brand/",
+    "prices.md",
+    "llmtop.config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
   "exports": {
     "./src/*": "./src/*",
     "./dashboard/src/*": "./dashboard/src/*",
     "./dashboard/dist/*": "./dashboard/dist/*",
     "./docs/brand/*": "./docs/brand/*",
-    "./package.json": "./package.json",
-    "./test/fixtures/*": "./test/fixtures/*"
+    "./package.json": "./package.json"
   },
   "scripts": {
     "start": "npm run build && node bin/llmtop.mjs serve",
     "dev": "vite dashboard",
     "build": "tsc --noEmit -p dashboard && vite build dashboard",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test && npm run check",
     "check": "tsc --noEmit -p dashboard",
     "test": "node --test \"test/*.test.mjs\" \"dashboard/src/*.test.ts\""
-  },
-  "dependencies": {
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.7"
   }

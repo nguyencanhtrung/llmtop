@@ -1,6 +1,6 @@
 # llmtop
 
-A local dashboard and CLI that reads the AI coding agent transcripts on this machine (Claude Code, Codex and Antigravity CLI) and shows usage and cost. Node 25+, no runtime dependencies besides React for the page; SQLite through `node:sqlite`.
+A local dashboard and CLI that reads the AI coding agent transcripts on this machine (Claude Code, Codex and Antigravity CLI) and shows usage and cost. Node 22.15+, zero runtime dependencies (dashboard assets bundled at build time); SQLite through `node:sqlite`.
 
 ## Commands
 
@@ -21,7 +21,7 @@ Run `make test` and `make check` after every change; `make build` when the dashb
 | Path | Holds |
 | --- | --- |
 | `bin/llmtop.mjs` | CLI entry: scan, show, usage, prices, serve |
-| `src/config.mjs` | `llmtop.config.json` (optional) and its defaults; unknown keys pass through |
+| `src/config.mjs` | Optional config (`~/.config/llmtop/config.json` by default, or `./llmtop.config.json` if present locally) and defaults (`~/.config/llmtop/data/`); unknown keys pass through |
 | `src/providers/` | One module per transcript source (`claude.mjs`, `codex.mjs`, `agy.mjs`); `index.mjs` lists them |
 | `src/archive.mjs`, `src/scan.mjs` | Append-only copy of each provider's transcripts under `data/archive/<provider>/`, then ingest |
 | `src/db.mjs` | Schema of `data/usage.db`; bump `SCHEMA_VERSION` on any change and the database is rebuilt from the archive |

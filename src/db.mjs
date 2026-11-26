@@ -79,12 +79,12 @@ export function openDb(path) {
 
 // For commands that only read: the database must exist at the current schema.
 export function readDb(path) {
-  if (!existsSync(path)) throw new Error("no database yet: run `node bin/llmtop.mjs scan` first");
+  if (!existsSync(path)) throw new Error("no database yet: run `llmtop scan` first");
   const db = new DatabaseSync(path, { readOnly: true });
   const version = db.prepare("SELECT value FROM meta WHERE key = 'schema'").get()?.value;
   if (version !== String(SCHEMA_VERSION)) {
     db.close();
-    throw new Error("the database predates this version of the tool: run `node bin/llmtop.mjs scan` to rebuild it");
+    throw new Error("the database predates this version of the tool: run `llmtop scan` to rebuild it");
   }
   return db;
 }

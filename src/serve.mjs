@@ -38,7 +38,7 @@ export function serve(config, { port, onScan = () => {}, dist = DIST, routes }) 
     }
   });
   return new Promise((resolve, reject) => {
-    server.once("error", (err) => reject(err.code === "EADDRINUSE" ? new Error(`port ${port} is in use: pass --port or change port in llmtop.config.json`) : err));
+    server.once("error", (err) => reject(err.code === "EADDRINUSE" ? new Error(`port ${port} is in use: pass --port or change port in ~/.config/llmtop/config.json`) : err));
     server.listen(port, "127.0.0.1", () => resolve(server));
   });
 }

@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { loadConfig } from "../src/config.mjs";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { loadConfig, ROOT } from "../src/config.mjs";
 import { localTime } from "../src/format.mjs";
 import { pricesCommand } from "../src/prices-command.mjs";
 import { scan, scanReport } from "../src/scan.mjs";
@@ -7,7 +9,9 @@ import { serve } from "../src/serve.mjs";
 import { show } from "../src/show.mjs";
 import { usageCommand } from "../src/usage-command.mjs";
 
-const USAGE = `usage: node bin/llmtop.mjs <command> [options]
+const { version: VERSION } = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+
+const USAGE = `usage: llmtop <command> [options]
 
   scan                                  archive new transcript lines and ingest them
   show <session>:<line>                 print one archived record
@@ -16,7 +20,12 @@ const USAGE = `usage: node bin/llmtop.mjs <command> [options]
   prices                                the price table checked against the host's cost records
   serve [--port n]                      the built dashboard on http://localhost:<port>
 
-Listing commands accept --json.`;
+Options:
+  -h, --help                            show this help message
+  -v, --version                         show version (${VERSION})
+
+Listing commands accept --json. Config and data default to ~/.config/llmtop
+(override with LLMTOP_CONFIG and LLMTOP_DATA).`;
 
 const COMMANDS = {
   async scan({ config, out }) {
@@ -67,6 +76,14 @@ function reportScan(t, out, prefix = "") {
 
 async function main(argv) {
   const [command, ...rest] = argv;
+  if (command === "-v" || command === "--version" || command === "version") {
+    process.stdout.write(`${VERSION}\n`);
+    return 0;
+  }
+  if (command === "-h" || command === "--help" || command === "help") {
+    process.stdout.write(`${USAGE}\n`);
+    return 0;
+  }
   const run = COMMANDS[command];
   if (!run) {
     process.stderr.write(`${command ? `unknown command: ${command}\n\n` : ""}${USAGE}\n`);

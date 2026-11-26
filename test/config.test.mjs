@@ -3,8 +3,35 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadConfig, ROOT } from "../src/config.mjs";
+import { defaultConfigDir, defaultConfigPath, loadConfig, ROOT } from "../src/config.mjs";
 import { projectOf } from "../src/derive.mjs";
+
+test("default config and data resolve under XDG / ~/.config/llmtop", () => {
+  const home = "/tmp/fake-home";
+  assert.equal(defaultConfigDir({}, home), join(home, ".config", "llmtop"));
+  assert.equal(defaultConfigDir({ XDG_CONFIG_HOME: "/tmp/xdg-cfg" }, home), join("/tmp/xdg-cfg", "llmtop"));
+  assert.equal(defaultConfigDir({ XDG_CONFIG_HOME: "relative/path" }, home), join(home, ".config", "llmtop"));
+
+  assert.equal(defaultConfigPath({ LLMTOP_CONFIG: "/custom/cfg.json", XDG_CONFIG_HOME: "/tmp/xdg-cfg" }, home), "/custom/cfg.json");
+
+  const dir = mkdtempSync(join(tmpdir(), "llmtop-xdg-"));
+  const xdgCfg = defaultConfigPath({ XDG_CONFIG_HOME: dir }, home);
+  assert.equal(xdgCfg, join(dir, "llmtop", "config.json"));
+
+  const c = loadConfig(undefined, { XDG_CONFIG_HOME: dir });
+  assert.equal(c.configPath, xdgCfg);
+  assert.equal(c.data, join(dir, "llmtop", "data"));
+  assert.equal(c.archive, join(dir, "llmtop", "data", "archive"));
+  assert.equal(c.database, join(dir, "llmtop", "data", "usage.db"));
+
+  const customData = join(dir, "custom-data");
+  const cDataEnv = loadConfig(undefined, { XDG_CONFIG_HOME: dir, LLMTOP_DATA: customData });
+  assert.equal(cDataEnv.data, customData);
+
+  const file = join(dir, "explicit.json");
+  writeFileSync(file, JSON.stringify({ data: "./stored" }));
+  assert.equal(loadConfig(file, { LLMTOP_DATA: customData }).data, join(dir, "stored"));
+});
 
 test("a missing config file means defaults", () => {
   const dir = mkdtempSync(join(tmpdir(), "llmtop-test-"));

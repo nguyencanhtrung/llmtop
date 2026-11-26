@@ -10,7 +10,7 @@
 _Transcripts are archived into SQLite and priced on your own machine. The server binds to `127.0.0.1` only, and neither the server nor the dashboard makes a network request._
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D25-blue)](package.json)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-blue)](package.json)
 [![Last commit](https://img.shields.io/github/last-commit/nguyencanhtrung/llmtop)](https://github.com/nguyencanhtrung/llmtop/commits/main)
 
 [Quickstart](#quickstart) · [Features](#features) · [Commands](#commands) · [Docs](#documentation) · [License](#license)
@@ -28,18 +28,18 @@ _Transcripts are archived into SQLite and priced on your own machine. The server
 
 llmtop is a local dashboard and CLI for developers using AI coding agents. It archives local transcripts from Claude Code (`~/.claude/projects`), Codex (`~/.codex/sessions`) and Antigravity CLI (`~/.gemini/antigravity-cli`), ingests them into SQLite through `node:sqlite`, and prices every request against [prices.md](prices.md). Providers with no local transcripts are skipped automatically. Seven views and a matching CLI answer what summary totals hide: which repository costs the most, which sessions ran long, which models and subagents did the work, why the prompt cache rebuilt, and what carrying long context costs.
 
-Nothing leaves your machine. The HTTP server binds to `127.0.0.1` only, and neither the server nor the browser app makes any outbound network request. The `data/` directory is ignored by Git: `data/archive/<provider>/` keeps an append-only copy of each transcript so history survives host deletion, while `data/usage.db` is disposable and rebuilt from the archive whenever the schema changes. Cost figures use list prices from [prices.md](prices.md); on a subscription plan, cost represents quota spent rather than direct billing.
+Nothing leaves your machine. The HTTP server binds to `127.0.0.1` only, and neither the server nor the browser app makes any outbound network request. Archives and the SQLite database live under `~/.config/llmtop/data/` by default: `archive/<provider>/` keeps an append-only copy of each transcript so history survives host deletion, while `usage.db` is disposable and rebuilt from the archive whenever the schema changes. Cost figures use list prices from [prices.md](prices.md); on a subscription plan, cost represents quota spent rather than direct billing.
 
 ## Features
 
-- **Multi-provider transcript archiving.** Reads Claude Code, Codex and Antigravity CLI transcripts into append-only zstd-compressed frames under `data/archive/<provider>/`, keeping line numbers stable so `session:line` references never drift even if the host removes old files.
+- **Multi-provider transcript archiving.** Reads Claude Code, Codex and Antigravity CLI transcripts into append-only zstd-compressed frames under `~/.config/llmtop/data/archive/<provider>/`, keeping line numbers stable so `session:line` references never drift even if the host removes old files.
 - **Prompt cache rebuild analysis.** Tracks every cache rebuild, its extra write cost compared to reading, and its cause: session start, compaction, idle break past the cache lifetime (`5–15m`, `15–60m`, `>1h`), or other.
 - **Context and compaction replay.** Measures what each compaction costs, breaks down context-reading cost by carried context size, and replays main conversations counterfactually to compare compaction thresholds.
 - **Project cost treemap.** Groups sessions by repository (nearest `.git` directory above the session working directory, or folder name fallback) and sizes tiles by cost.
 - **Model and subagent breakdown.** Reports output and thinking tokens per request, requests per owner turn, tool calls and failure share, output speed, effort-level cost, and the share of work delegated to subagents by model.
 - **Sortable session explorer.** Lists every conversation with its title, length, model, cost, and cache lapse count.
 - **Matching CLI and dashboard.** Provides `scan`, `show`, `usage`, `prices`, and `serve` (with `--json` on listing commands). For the same window and filters, `usage` and the dashboard report identical totals.
-- **Bilingual local dashboard.** Built with Vite, React and TypeScript with automatic light/dark themes, English and Vietnamese UI strings, and zero external runtime dependencies beyond React and Node's built-in `node:sqlite`.
+- **Bilingual local dashboard.** Built with Vite, React and TypeScript with automatic light/dark themes, English and Vietnamese UI strings, and zero runtime npm dependencies at install time (bundled UI assets + Node's built-in `node:sqlite`).
 - **Private by default.** Serves exclusively on `127.0.0.1` with no telemetry, remote API calls, or asset CDNs.
 
 <p align="center">
@@ -89,12 +89,30 @@ Nothing leaves your machine. The HTTP server binds to `127.0.0.1` only, and neit
 
 ## Prerequisites
 
-- **Node.js 25 or later** (required by [package.json](package.json) for built-in `node:sqlite` and zstd support) and **npm**
+- **Node.js 22.15 or later** (required by [package.json](package.json) for built-in `node:sqlite` and zstd support) and **npm**
 - **Local agent transcripts** from at least one supported tool (`~/.claude/projects`, `~/.codex/sessions`, or `~/.gemini/antigravity-cli`); optional if previewing with `make demo`
 - Optional: **`make`** for convenience targets (every workflow also runs directly via `npm` and `node`)
 - Optional: **Google Chrome or Chromium** only if regenerating README screenshots with `make screenshots` (set `CHROME` to override the binary path)
 
 ## Quickstart
+
+Install globally from npm (zero runtime dependencies):
+
+```bash
+npm install -g llmtop
+llmtop serve
+```
+
+Or run once without installing:
+
+```bash
+npx llmtop serve
+```
+
+Open <http://localhost:4310>. Your first visit scans local transcripts into `~/.config/llmtop/data/`; use the Refresh button in the sidebar footer to scan again. Pass `--port <n>` to `llmtop serve` to use another port, or press `Ctrl+C` to stop.
+
+<details>
+<summary><strong>From source (development)</strong></summary>
 
 ```bash
 git clone https://github.com/nguyencanhtrung/llmtop.git
@@ -102,36 +120,37 @@ cd llmtop
 make start
 ```
 
-`make start` installs dependencies via `npm ci` when needed, builds `dashboard/dist`, starts the server in the background on `http://localhost:4310` (bound to `127.0.0.1`, PID in `data/serve.pid`, output in `data/serve.log`), and returns once ready. Stop it anytime with `make stop`.
-
-Open <http://localhost:4310>. Your first visit scans local transcripts into `data/`; use the Refresh button in the sidebar footer to scan again. Without `make`, run `npm install` then `npm start` (serves in the foreground until `Ctrl+C`).
+`make start` installs dependencies via `npm ci` when needed, builds `dashboard/dist`, starts the server in the background on `http://localhost:4310` (`data/serve.pid`, `data/serve.log`), and returns once ready. Stop it anytime with `make stop`. Without `make`, run `npm install` then `npm start`.
 
 To explore ten weeks of synthetic usage data without scanning your local transcripts, run `make demo` and open <http://localhost:4311>.
 
+</details>
+
 ## Commands
 
-| `make` target | Equivalent command | What it does |
+| CLI command | `make` target | What it does |
 | --- | --- | --- |
-| `make start` | `npm start` | Build the dashboard and serve it (in the background via `make start`; foreground via `npm start`) |
-| `make stop` | | Stop the background server started by `make start` |
-| `make dev` | `npm run dev` | Serve the dashboard with Vite hot reload in the foreground |
-| `make demo` | `node test/fixtures/demo.mjs` | Serve ten weeks of synthetic demo data at `http://localhost:4311` |
-| `make scan` | `node bin/llmtop.mjs scan` | Archive new transcript lines and ingest them into `data/usage.db` |
-| `make usage DAYS=30 BY=model` | `node bin/llmtop.mjs usage --days 30 --by model` | Show tokens and cost in the terminal; `ARGS="..."` passes extra flags |
-| `make prices` | `node bin/llmtop.mjs prices` | Check [prices.md](prices.md) against host-recorded session costs |
-| `make test` | `npm test` | Run the `node --test` suite on synthetic data |
-| `make check` | `npm run check` | Type-check `dashboard/` with TypeScript |
-| `make build` | `npm run build` | Type-check and build `dashboard/dist` |
+| `llmtop serve [--port n]` | `make start` | Serve the dashboard on `http://localhost:<port>` (`make start` runs in the background) |
+| | `make stop` | Stop the background server started by `make start` |
+| `npm run dev` | `make dev` | Serve the dashboard with Vite hot reload in the foreground |
+| `node test/fixtures/demo.mjs` | `make demo` | Serve ten weeks of synthetic demo data at `http://localhost:4311` |
+| `llmtop scan` | `make scan` | Archive new transcript lines and ingest them into `usage.db` |
+| `llmtop usage --days 30 --by model` | `make usage DAYS=30 BY=model` | Show tokens and cost in the terminal; `ARGS="..."` passes extra flags |
+| `llmtop prices` | `make prices` | Check [prices.md](prices.md) against host-recorded session costs |
+| `npm test` | `make test` | Run the `node --test` suite on synthetic data |
+| `npm run check` | `make check` | Type-check `dashboard/` with TypeScript |
+| `npm run build` | `make build` | Type-check and build `dashboard/dist` |
 
 Run `make` alone to list targets. Full CLI reference:
 
 ```text
-node bin/llmtop.mjs scan                                  archive new transcript lines and ingest them
-node bin/llmtop.mjs show <session>:<line>                 print one archived record
-node bin/llmtop.mjs usage [--days n | --since d --until d] [--by day|model|provider|effort|project|session|hour|tool|skill|subagent]
-                          [--provider name] [--project name] [--model family] [--effort level]
-node bin/llmtop.mjs prices                                the price table checked against the host's cost records
-node bin/llmtop.mjs serve [--port n]                      the built dashboard on http://localhost:<port>
+llmtop scan                                  archive new transcript lines and ingest them
+llmtop show <session>:<line>                 print one archived record
+llmtop usage [--days n | --since d --until d] [--by day|model|provider|effort|project|session|hour|tool|skill|subagent]
+             [--provider name] [--project name] [--model family] [--effort level]
+llmtop prices                                the price table checked against the host's cost records
+llmtop serve [--port n]                      the built dashboard on http://localhost:<port>
+llmtop --help | --version                    show CLI usage or installed version
 ```
 
 Listing commands accept `--json`. For one window and one set of filters, `usage` and the dashboard report the same totals.
@@ -142,15 +161,17 @@ Listing commands accept `--json`. For one window and one set of filters, `usage`
 <summary><strong>Where data lives</strong></summary>
 
 ```text
-data/
-├── archive/
-│   ├── claude/     append-only .jsonl.zst frames, line numbers stable
-│   ├── codex/      append-only .jsonl.zst frames + session_index.jsonl
-│   └── agy/        append-only .jsonl.zst frames
-└── usage.db        SQLite database rebuilt from archive on schema changes
+~/.config/llmtop/
+├── config.json         optional configuration file
+└── data/
+    ├── archive/
+    │   ├── claude/     append-only .jsonl.zst frames, line numbers stable
+    │   ├── codex/      append-only .jsonl.zst frames + session_index.jsonl
+    │   └── agy/        append-only .jsonl.zst frames
+    └── usage.db        SQLite database rebuilt from archive on schema changes
 ```
 
-The archive preserves transcripts even if the host tool later deletes them. `data/` is gitignored; deleting `data/usage.db` is safe and the next scan rebuilds it from `data/archive/`.
+The archive preserves transcripts even if the host tool later deletes them. Deleting `usage.db` is safe and the next `llmtop scan` rebuilds it from `archive/`. In a cloned repository, if `llmtop.config.json` exists in the repo root and `~/.config/llmtop/config.json` does not, the local repo config is still used for convenience.
 
 A session's project is resolved to the nearest directory at or above its working directory containing `.git`; if none exists, the directory's own name is used.
 
@@ -212,15 +233,15 @@ The Activity view and `usage --by skill` count skill invocations by name across 
 <details>
 <summary><strong>Configuration (optional)</strong></summary>
 
-Copy [llmtop.config.example.json](llmtop.config.example.json) to `llmtop.config.json` in the repository root, or set `LLMTOP_CONFIG` to point to another config file. All keys are optional; relative paths resolve from the config file's directory, and unknown keys pass through untouched.
+Create `~/.config/llmtop/config.json` (using [llmtop.config.example.json](llmtop.config.example.json) as a reference), or set `XDG_CONFIG_HOME` / `LLMTOP_CONFIG` to point elsewhere (`LLMTOP_DATA` overrides the data folder). All keys are optional; relative paths resolve from the config file's directory, and unknown keys pass through untouched.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `providers` | `{ "claude": { "transcripts": "~/.claude/projects" }, "codex": { "transcripts": "~/.codex/sessions" }, "agy": { "transcripts": "~/.gemini/antigravity-cli" } }` | Enabled transcript sources (`claude`, `codex`, `agy`); any other provider key raises an error |
-| `data` | `data` | Directory for `archive/` and `usage.db` |
+| `data` | `data` (inside `~/.config/llmtop`) | Directory for `archive/` and `usage.db` |
 | `port` | `4310` | HTTP server port |
 | `timeZone` | System time zone | Time zone used to bucket days and hours |
-| `prices` | `prices.md` in repository root | Markdown price table |
+| `prices` | `prices.md` bundled in package | Markdown price table |
 
 </details>
 
