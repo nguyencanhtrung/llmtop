@@ -128,7 +128,7 @@ export function createIngester(db, timeZone, hasFile = () => false) {
   const CLAUDE_READ_TOOLS = new Set(["Read", "Grep", "Glob"]);
 
   // file: { id, kind, session_id, agent_id }. Returns how many records were added, and the line's cwd and timestamp.
-  return function ingestLine(file, line, text) {
+  function ingestLine(file, line, text) {
     let rec;
     try {
       rec = JSON.parse(text);
@@ -144,20 +144,14 @@ export function createIngester(db, timeZone, hasFile = () => false) {
     let st = stateByFile.get(file.id);
     if (!st) {
       const prev = file.lines > 0 ? q.getTargetPaths.get(file.id) : null;
-      st = { launchCwd: file.cwd ?? null, cwd: file.cwd ?? null, paths: createPathTracker(prev?.target_paths ?? null) };
+      st = { launchCwd: file.cwd ?? null, cwd: file.cwd ?? null, paths: createPathTracker(prev?.target_paths ?? null), pathsDirty: false };
       stateByFile.set(file.id, st);
     }
-    let pathsDirty = false;
     if (!foreign && rec.cwd) {
       st.launchCwd ??= rec.cwd;
       st.cwd = rec.cwd;
-      if (rec.cwd !== st.launchCwd && st.paths.add(rec.cwd, { write: false })) pathsDirty = true;
+      if (rec.cwd !== st.launchCwd && st.paths.add(rec.cwd, { write: false })) st.pathsDirty = true;
     }
-    const flushPaths = () => {
-      if (!pathsDirty) return;
-      const json = st.paths.toJSON();
-      if (json) q.upsertTargetPaths.run(file.id, json);
-    };
 
     if (rec.type === "cost-state") {
       // Per model: the host's cost and the tokens it priced; `split` tells whether 5m and 1h cache writes are told apart.
@@ -168,20 +162,17 @@ export function createIngester(db, timeZone, hasFile = () => false) {
       }]));
       q.cost.run(file.id, line, session, rec.startTime ?? null, rec.totalCostUSD ?? null, rec.hasUnknownModelCost ? 1 : 0,
         rec.totalAPIDuration ?? null, rec.totalToolDuration ?? null, rec.totalLinesAdded ?? null, rec.totalLinesRemoved ?? null, JSON.stringify(models));
-      flushPaths();
       return { added: 1, ...seen };
     }
     if (rec.type === "custom-title" && rec.customTitle) {
       q.title.run(file.id, line, session, "custom", rec.customTitle);
-      flushPaths();
       return { added: 1, ...seen };
     }
     if (rec.type === "ai-title" && rec.aiTitle) {
       q.title.run(file.id, line, session, "ai", rec.aiTitle);
-      flushPaths();
       return { added: 1, ...seen };
     }
-    if (!rec.uuid) { flushPaths(); return { added: 0, ...seen }; }
+    if (!rec.uuid) return { added: 0, ...seen };
 
     // A copied record belongs to the file of the session that wrote it, whichever file is read first;
     // here only note which requests it repeats. A copy whose original file is gone is kept here.
@@ -211,13 +202,13 @@ export function createIngester(db, timeZone, hasFile = () => false) {
           q.call.run(b.id, file.id, line, session, agent, rec.timestamp ?? null, b.name ?? "unknown", msg.model ?? null);
           if (CLAUDE_WRITE_TOOLS.has(b.name)) {
             const fp = b.input?.file_path ?? b.input?.notebook_path;
-            if (st.paths.add(fp, { isFile: true, write: true, baseCwd: st.cwd })) pathsDirty = true;
+            if (st.paths.add(fp, { isFile: true, write: true, baseCwd: st.cwd })) st.pathsDirty = true;
           } else if (CLAUDE_READ_TOOLS.has(b.name)) {
-            if (b.input?.file_path && st.paths.add(b.input.file_path, { isFile: true, write: false, baseCwd: st.cwd })) pathsDirty = true;
-            if (b.input?.path && st.paths.add(b.input.path, { isFile: false, write: false, baseCwd: st.cwd })) pathsDirty = true;
+            if (b.input?.file_path && st.paths.add(b.input.file_path, { isFile: true, write: false, baseCwd: st.cwd })) st.pathsDirty = true;
+            if (b.input?.path && st.paths.add(b.input.path, { isFile: false, write: false, baseCwd: st.cwd })) st.pathsDirty = true;
           } else if (b.name === "Bash" && typeof b.input?.command === "string") {
             for (const dir of extractCommandDirs(b.input.command, st.cwd)) {
-              if (st.paths.add(dir, { write: false })) pathsDirty = true;
+              if (st.paths.add(dir, { write: false })) st.pathsDirty = true;
             }
           }
         }
@@ -255,9 +246,17 @@ export function createIngester(db, timeZone, hasFile = () => false) {
         }
       }
     }
-    flushPaths();
     return { added: 1, ...seen };
+  }
+  ingestLine.flush = (fileId) => {
+    const st = stateByFile.get(fileId);
+    if (!st || !st.pathsDirty) return;
+    st.pathsDirty = false;
+    const json = st.paths.toJSON();
+    if (json) q.upsertTargetPaths.run(fileId, json);
   };
+  ingestLine.reset = (fileId) => { stateByFile.delete(fileId); };
+  return ingestLine;
 }
 
 // The type and parent tool call of a subagent, from the meta file archived beside its transcript.

@@ -250,7 +250,7 @@ export function createIngester(db, timeZone) {
   };
   const stateByFile = new Map();
 
-  return function ingestLine(file, line, text) {
+  function ingestLine(file, line, text) {
     let rec;
     try {
       rec = JSON.parse(text);
@@ -271,6 +271,7 @@ export function createIngester(db, timeZone) {
         baseAdded: prevStats?.lines_added ?? 0, baseRemoved: prevStats?.lines_removed ?? 0,
         sawFileChange: false, fcAdded: 0, fcRemoved: 0, patchAdded: 0, patchRemoved: 0,
         paths: createPathTracker(prevStats?.target_paths ?? null),
+        statsDirty: false, pathsDirty: false,
       };
       stateByFile.set(file.id, st);
     }
@@ -284,15 +285,13 @@ export function createIngester(db, timeZone) {
     const tsMs = Number.isFinite(parsedTs) ? parsedTs : null;
     let cwd = p.cwd ?? null;
     let added = 0;
-    let statsDirty = false;
-    let pathsDirty = false;
 
     const consumeOpenWait = () => {
       if (tsMs !== null && st.lastWaitFromMs !== null) {
         const dt = tsMs - st.lastWaitFromMs;
         if (dt > 0 && dt < 600_000) {
           st.openApiMs += dt;
-          statsDirty = true;
+          st.statsDirty = true;
         }
         st.lastWaitFromMs = null;
       }
@@ -333,7 +332,7 @@ export function createIngester(db, timeZone) {
       if (p.cwd) {
         st.launchCwd ??= p.cwd;
         st.cwd = p.cwd;
-        if (p.cwd !== st.launchCwd && st.paths.add(p.cwd, { write: false })) pathsDirty = true;
+        if (p.cwd !== st.launchCwd && st.paths.add(p.cwd, { write: false })) st.pathsDirty = true;
       }
       if (p.model) st.model = p.model;
       const eff = p.effort ?? p.collaboration_mode?.settings?.reasoning_effort;
@@ -383,12 +382,12 @@ export function createIngester(db, timeZone) {
           if (patch.added || patch.removed) {
             st.patchAdded += patch.added;
             st.patchRemoved += patch.removed;
-            if (!st.sawFileChange) statsDirty = true;
+            if (!st.sawFileChange) st.statsDirty = true;
           }
           if (inputStr.includes("*** ")) {
             const unesc = inputStr.includes("*** Begin Patch\\n") ? inputStr.replace(/\\n/g, "\n") : inputStr;
             for (const m of unesc.matchAll(/^\*\*\* (?:Update|Add|Delete) File:\s*([^\r\n`"]+)/gm)) {
-              if (st.paths.add(m[1].trim(), { isFile: true, write: true, baseCwd: st.cwd })) pathsDirty = true;
+              if (st.paths.add(m[1].trim(), { isFile: true, write: true, baseCwd: st.cwd })) st.pathsDirty = true;
             }
           }
           const vars = new Map();
@@ -397,10 +396,10 @@ export function createIngester(db, timeZone) {
           }
           for (const m of inputStr.matchAll(/(?:workdir|"workdir")\s*:\s*(?:["'`]([^"'`\n]+)["'`]|([A-Za-z_$][\w$]*))/g)) {
             const wd = m[1] ?? (m[2] ? vars.get(m[2]) : null);
-            if (wd && st.paths.add(wd, { write: false, baseCwd: st.cwd })) pathsDirty = true;
+            if (wd && st.paths.add(wd, { write: false, baseCwd: st.cwd })) st.pathsDirty = true;
           }
           for (const dir of extractCommandDirs(inputStr, st.cwd)) {
-            if (st.paths.add(dir, { write: false })) pathsDirty = true;
+            if (st.paths.add(dir, { write: false })) st.pathsDirty = true;
           }
           const loadedSkills = extractSkillPaths(inputStr);
           if (loadedSkills.length) {
@@ -429,7 +428,7 @@ export function createIngester(db, timeZone) {
         if (dur > 0) {
           st.toolMs += dur;
           st.turnToolMs += dur;
-          statsDirty = true;
+          st.statsDirty = true;
         }
         if (tsMs !== null) st.lastWaitFromMs = tsMs;
       } else if (p.type === "compaction") {
@@ -454,10 +453,10 @@ export function createIngester(db, timeZone) {
           : (st.turnStartMs !== null && tsMs !== null ? Math.max(0, tsMs - st.turnStartMs) : null);
         if (totalTurn !== null) {
           st.completedApiMs += Math.max(0, totalTurn - Math.min(totalTurn, st.turnToolMs));
-          statsDirty = true;
+          st.statsDirty = true;
         } else if (st.openApiMs > 0) {
           st.completedApiMs += st.openApiMs;
-          statsDirty = true;
+          st.statsDirty = true;
         }
         st.turnStartMs = null;
         st.turnToolMs = 0;
@@ -478,7 +477,7 @@ export function createIngester(db, timeZone) {
       } else if (p.type === "item_completed" && p.item?.type === "FileChange") {
         if (!p.item.status || p.item.status === "completed") {
           for (const [fp, ch] of Object.entries(p.item.changes ?? {})) {
-            if (st.paths.add(fp, { isFile: true, write: true, baseCwd: st.cwd })) pathsDirty = true;
+            if (st.paths.add(fp, { isFile: true, write: true, baseCwd: st.cwd })) st.pathsDirty = true;
             if (ch?.type === "add") st.fcAdded += lineCount(ch.content);
             else if (ch?.type === "delete") st.fcRemoved += lineCount(ch.content);
             else if (ch?.type === "update" && typeof ch.unified_diff === "string") {
@@ -488,7 +487,7 @@ export function createIngester(db, timeZone) {
             }
           }
           st.sawFileChange = true;
-          statsDirty = true;
+          st.statsDirty = true;
         }
       } else if (p.type === "token_count" && !st.sawTokenRec && p.info?.last_token_usage) {
         consumeOpenWait();
@@ -501,19 +500,28 @@ export function createIngester(db, timeZone) {
       }
     }
 
-    const totalApiMs = Math.round(st.completedApiMs + st.openApiMs);
-    const linesAdded = st.baseAdded + (st.sawFileChange ? st.fcAdded : st.patchAdded);
-    const linesRemoved = st.baseRemoved + (st.sawFileChange ? st.fcRemoved : st.patchRemoved);
-    if (statsDirty && (totalApiMs > 0 || st.toolMs > 0 || linesAdded > 0 || linesRemoved > 0)) {
-      q.upsertStats.run(file.id, totalApiMs, Math.round(st.toolMs), linesAdded, linesRemoved);
-    }
-    if (pathsDirty) {
-      const json = st.paths.toJSON();
-      if (json) q.upsertTargetPaths.run(file.id, json);
-    }
-
     return { added, cwd, ts, own: true };
+  }
+  ingestLine.flush = (fileId) => {
+    const st = stateByFile.get(fileId);
+    if (!st) return;
+    if (st.statsDirty) {
+      st.statsDirty = false;
+      const totalApiMs = Math.round(st.completedApiMs + st.openApiMs);
+      const linesAdded = st.baseAdded + (st.sawFileChange ? st.fcAdded : st.patchAdded);
+      const linesRemoved = st.baseRemoved + (st.sawFileChange ? st.fcRemoved : st.patchRemoved);
+      if (totalApiMs > 0 || st.toolMs > 0 || linesAdded > 0 || linesRemoved > 0) {
+        q.upsertStats.run(fileId, totalApiMs, Math.round(st.toolMs), linesAdded, linesRemoved);
+      }
+    }
+    if (st.pathsDirty) {
+      st.pathsDirty = false;
+      const json = st.paths.toJSON();
+      if (json) q.upsertTargetPaths.run(fileId, json);
+    }
   };
+  ingestLine.reset = (fileId) => { stateByFile.delete(fileId); };
+  return ingestLine;
 }
 
 export function postScan(db, archiveDir) {
@@ -530,13 +538,17 @@ export function postScan(db, archiveDir) {
   }
 
   const allFiles = db.prepare("SELECT id, kind, session_id, agent_id FROM files WHERE provider = 'codex'").all();
+  const byFileId = new Map();
   const byOwn = new Map();
-  for (const f of allFiles) byOwn.set(f.agent_id ?? f.session_id, f);
+  for (const f of allFiles) {
+    byFileId.set(f.id, f);
+    byOwn.set(f.agent_id ?? f.session_id, f);
+  }
 
   const metas = db.prepare("SELECT m.file_id, m.parent_session_id, m.subagent_type, m.tool_use_id FROM file_meta m JOIN files f ON f.id = m.file_id WHERE f.provider = 'codex'").all();
   const parentOf = new Map();
   for (const m of metas) {
-    const f = allFiles.find((x) => x.id === m.file_id);
+    const f = byFileId.get(m.file_id);
     if (f && m.parent_session_id) parentOf.set(f.agent_id ?? f.session_id, { parent: m.parent_session_id, type: m.subagent_type, toolUseId: m.tool_use_id });
   }
   const rootOf = (id) => {
@@ -551,15 +563,20 @@ export function postScan(db, archiveDir) {
     return cur === id ? null : cur;
   };
 
+  const existingSubs = new Map(db.prepare("SELECT agent_id, session_id, type, tool_use_id FROM subagents").all().map((s) => [s.agent_id, s]));
+  const existingTitles = new Map(db.prepare("SELECT file_id, session_id, title FROM titles WHERE line = 0 AND kind = 'custom'").all().map((t) => [t.file_id, t]));
+
   const setFileSub = db.prepare("UPDATE files SET kind = 'sub', session_id = ?, agent_id = ? WHERE id = ?");
   const setReqSub = db.prepare("UPDATE requests SET session_id = ?, agent_id = ?, is_sub = 1 WHERE file_id = ?");
   const setCallSub = db.prepare("UPDATE tool_calls SET session_id = ?, agent_id = ? WHERE file_id = ?");
   const setSkillSess = db.prepare("UPDATE skills SET session_id = ? WHERE file_id = ?");
   const setCompSub = db.prepare("UPDATE compactions SET session_id = ?, agent_id = ? WHERE file_id = ?");
   const setTitleSess = db.prepare("UPDATE titles SET session_id = ? WHERE file_id = ?");
+  const delSession = db.prepare("DELETE FROM sessions WHERE id = ?");
   const putSub = db.prepare("INSERT OR REPLACE INTO subagents(agent_id, session_id, type, tool_use_id) VALUES (?, ?, ?, ?)");
   const putTitle = db.prepare("INSERT OR REPLACE INTO titles(file_id, line, session_id, kind, title) VALUES (?, 0, ?, 'custom', ?)");
 
+  const dirty = new Set();
   db.exec("BEGIN");
   try {
     for (const f of allFiles) {
@@ -567,23 +584,41 @@ export function postScan(db, archiveDir) {
       const root = rootOf(ownId);
       const sess = root ?? f.session_id;
       if (root) {
-        setFileSub.run(root, ownId, f.id);
-        setReqSub.run(root, ownId, f.id);
-        setCallSub.run(root, ownId, f.id);
-        setSkillSess.run(root, f.id);
-        setCompSub.run(root, ownId, f.id);
-        setTitleSess.run(root, f.id);
+        if (f.kind !== "sub" || f.session_id !== root || f.agent_id !== ownId) {
+          setFileSub.run(root, ownId, f.id);
+          setReqSub.run(root, ownId, f.id);
+          setCallSub.run(root, ownId, f.id);
+          setSkillSess.run(root, f.id);
+          setCompSub.run(root, ownId, f.id);
+          setTitleSess.run(root, f.id);
+          if (f.kind === "main") delSession.run(f.session_id);
+          dirty.add(f.session_id);
+          dirty.add(root);
+        }
         const meta = parentOf.get(ownId);
-        putSub.run(ownId, root, meta?.type ?? "subagent", meta?.toolUseId ?? null);
+        const type = meta?.type ?? "subagent";
+        const toolUseId = meta?.toolUseId ?? null;
+        const curSub = existingSubs.get(ownId);
+        if (!curSub || curSub.session_id !== root || curSub.type !== type || curSub.tool_use_id !== toolUseId) {
+          putSub.run(ownId, root, type, toolUseId);
+          dirty.add(root);
+        }
       }
       const title = titles.get(ownId);
-      if (title) putTitle.run(f.id, sess, title);
+      if (title) {
+        const curTitle = existingTitles.get(f.id);
+        if (!curTitle || curTitle.session_id !== sess || curTitle.title !== title) {
+          putTitle.run(f.id, sess, title);
+          dirty.add(sess);
+        }
+      }
     }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
   }
+  return dirty;
 }
 
 export const codex = { name: "codex", label, defaultPath, describe, listHost, syncMeta, createIngester, postScan, familyOf, displayModel };

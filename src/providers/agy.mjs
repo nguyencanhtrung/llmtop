@@ -232,7 +232,7 @@ export function createIngester(db, timeZone) {
   const AGY_WRITE_TOOLS = new Set(["edit_file", "write_file", "replace_file_content", "multi_replace_file_content", "write_to_file"]);
   const AGY_READ_TOOLS = new Set(["read_file", "view_file", "grep_search", "find_by_name", "list_dir", "run_command"]);
 
-  return function ingestLine(file, line, text) {
+  function ingestLine(file, line, text) {
     let rec;
     try {
       rec = JSON.parse(text);
@@ -248,6 +248,7 @@ export function createIngester(db, timeZone) {
         apiMs: prevStats?.api_ms ?? 0, toolMs: prevStats?.tool_ms ?? 0,
         linesAdded: prevStats?.lines_added ?? 0, linesRemoved: prevStats?.lines_removed ?? 0,
         paths: createPathTracker(prevStats?.target_paths ?? null),
+        statsDirty: false, pathsDirty: false,
       };
       stateByFile.set(file.id, st);
     }
@@ -261,18 +262,16 @@ export function createIngester(db, timeZone) {
     const tsMs = Number.isFinite(parsedTs) ? parsedTs : null;
     const uuid = `agy:${ownId}:${step}`;
     let added = 0;
-    let statsDirty = false;
-    let pathsDirty = false;
 
     if (tsMs !== null && st.lastTsMs !== null) {
       const dt = tsMs - st.lastTsMs;
       if (dt > 0 && dt < 600_000) {
         if (rec.type === "PLANNER_RESPONSE" && (st.lastType === "USER_INPUT" || st.lastType === "GENERIC" || st.lastType === "SYSTEM_MESSAGE")) {
           st.apiMs += Math.round(dt);
-          statsDirty = true;
+          st.statsDirty = true;
         } else if (rec.type === "GENERIC" && st.lastType === "PLANNER_RESPONSE") {
           st.toolMs += Math.round(dt);
-          statsDirty = true;
+          st.statsDirty = true;
         }
       }
     }
@@ -298,28 +297,28 @@ export function createIngester(db, timeZone) {
         if (diff.added || diff.removed) {
           st.linesAdded += diff.added;
           st.linesRemoved += diff.removed;
-          statsDirty = true;
+          st.statsDirty = true;
         }
         if (tc.args && typeof tc.args === "object") {
           if (AGY_WRITE_TOOLS.has(tc.name)) {
             for (const k of ["Path", "TargetFile", "AbsolutePath"]) {
               const val = unquote(tc.args[k]);
-              if (val && st.paths.add(val, { isFile: true, write: true })) pathsDirty = true;
+              if (val && st.paths.add(val, { isFile: true, write: true })) st.pathsDirty = true;
             }
           } else if (AGY_READ_TOOLS.has(tc.name)) {
             for (const k of ["Path", "AbsolutePath"]) {
               const val = unquote(tc.args[k]);
-              if (val && st.paths.add(val, { isFile: true, write: false })) pathsDirty = true;
+              if (val && st.paths.add(val, { isFile: true, write: false })) st.pathsDirty = true;
             }
             for (const k of ["SearchPath", "DirectoryPath", "Cwd"]) {
               const val = unquote(tc.args[k]);
-              if (val && st.paths.add(val, { isFile: false, write: false })) pathsDirty = true;
+              if (val && st.paths.add(val, { isFile: false, write: false })) st.pathsDirty = true;
             }
             if (tc.name === "run_command" && tc.args.CommandLine) {
               const cmd = unquote(tc.args.CommandLine);
               const cmdCwd = unquote(tc.args.Cwd) || null;
               for (const dir of extractCommandDirs(cmd, cmdCwd)) {
-                if (st.paths.add(dir, { write: false })) pathsDirty = true;
+                if (st.paths.add(dir, { write: false })) st.pathsDirty = true;
               }
             }
           }
@@ -362,26 +361,36 @@ export function createIngester(db, timeZone) {
       st.lastTsMs = tsMs;
       st.lastType = rec.type;
     }
-    if (statsDirty && (st.apiMs > 0 || st.toolMs > 0 || st.linesAdded > 0 || st.linesRemoved > 0)) {
-      q.upsertStats.run(file.id, st.apiMs, st.toolMs, st.linesAdded, st.linesRemoved);
-    }
-    if (pathsDirty) {
-      const json = st.paths.toJSON();
-      if (json) q.upsertTargetPaths.run(file.id, json);
-    }
 
     return { added, cwd: null, ts, own: true };
+  }
+  ingestLine.flush = (fileId) => {
+    const st = stateByFile.get(fileId);
+    if (!st) return;
+    if (st.statsDirty) {
+      st.statsDirty = false;
+      if (st.apiMs > 0 || st.toolMs > 0 || st.linesAdded > 0 || st.linesRemoved > 0) {
+        q.upsertStats.run(fileId, st.apiMs, st.toolMs, st.linesAdded, st.linesRemoved);
+      }
+    }
+    if (st.pathsDirty) {
+      st.pathsDirty = false;
+      const json = st.paths.toJSON();
+      if (json) q.upsertTargetPaths.run(fileId, json);
+    }
   };
+  ingestLine.reset = (fileId) => { stateByFile.delete(fileId); };
+  return ingestLine;
 }
 
 export function postScan(db, archiveDir) {
   const path = join(archiveDir, "summaries.json");
-  if (!existsSync(path)) return;
+  if (!existsSync(path)) return new Set();
   let meta;
   try {
     meta = JSON.parse(readFileSync(path, "utf8"));
   } catch {
-    return;
+    return new Set();
   }
 
   const allFiles = db.prepare("SELECT id, kind, session_id, agent_id, cwd FROM files WHERE provider = 'agy'").all();
@@ -400,39 +409,64 @@ export function postScan(db, archiveDir) {
     return cur === id ? null : cur;
   };
 
+  const existingSubs = new Map(db.prepare("SELECT agent_id, session_id, type, tool_use_id FROM subagents").all().map((s) => [s.agent_id, s]));
+  const existingTitles = new Map(db.prepare("SELECT file_id, session_id, title FROM titles WHERE line = 0 AND kind = 'ai'").all().map((t) => [t.file_id, t]));
+
   const setCwd = db.prepare("UPDATE files SET cwd = ? WHERE id = ?");
   const setFileSub = db.prepare("UPDATE files SET kind = 'sub', session_id = ?, agent_id = ? WHERE id = ?");
   const setReqSub = db.prepare("UPDATE requests SET session_id = ?, agent_id = ?, is_sub = 1 WHERE file_id = ?");
   const setCallSub = db.prepare("UPDATE tool_calls SET session_id = ?, agent_id = ? WHERE file_id = ?");
   const setSkillSess = db.prepare("UPDATE skills SET session_id = ? WHERE file_id = ?");
   const setTitleSess = db.prepare("UPDATE titles SET session_id = ? WHERE file_id = ?");
+  const delSession = db.prepare("DELETE FROM sessions WHERE id = ?");
   const putSub = db.prepare("INSERT OR REPLACE INTO subagents(agent_id, session_id, type, tool_use_id) VALUES (?, ?, ?, NULL)");
   const putTitle = db.prepare("INSERT OR REPLACE INTO titles(file_id, line, session_id, kind, title) VALUES (?, 0, ?, 'ai', ?)");
 
+  const dirty = new Set();
   db.exec("BEGIN");
   try {
     for (const f of allFiles) {
       const ownId = f.agent_id ?? f.session_id;
       const m = meta[ownId];
       if (!m) continue;
-      if (m.cwd && !f.cwd) setCwd.run(m.cwd, f.id);
       const root = rootOf(ownId);
       const sess = root ?? f.session_id;
-      if (root) {
-        setFileSub.run(root, ownId, f.id);
-        setReqSub.run(root, ownId, f.id);
-        setCallSub.run(root, ownId, f.id);
-        setSkillSess.run(root, f.id);
-        setTitleSess.run(root, f.id);
-        putSub.run(ownId, root, m.agentName || "subagent");
+      if (m.cwd && !f.cwd) {
+        setCwd.run(m.cwd, f.id);
+        dirty.add(sess);
       }
-      if (m.title) putTitle.run(f.id, sess, m.title);
+      if (root) {
+        if (f.kind !== "sub" || f.session_id !== root || f.agent_id !== ownId) {
+          setFileSub.run(root, ownId, f.id);
+          setReqSub.run(root, ownId, f.id);
+          setCallSub.run(root, ownId, f.id);
+          setSkillSess.run(root, f.id);
+          setTitleSess.run(root, f.id);
+          if (f.kind === "main") delSession.run(f.session_id);
+          dirty.add(f.session_id);
+          dirty.add(root);
+        }
+        const type = m.agentName || "subagent";
+        const curSub = existingSubs.get(ownId);
+        if (!curSub || curSub.session_id !== root || curSub.type !== type || curSub.tool_use_id !== null) {
+          putSub.run(ownId, root, type);
+          dirty.add(root);
+        }
+      }
+      if (m.title) {
+        const curTitle = existingTitles.get(f.id);
+        if (!curTitle || curTitle.session_id !== sess || curTitle.title !== m.title) {
+          putTitle.run(f.id, sess, m.title);
+          dirty.add(sess);
+        }
+      }
     }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
   }
+  return dirty;
 }
 
 export const agy = { name: "agy", label, defaultPath, describe, listHost, syncMeta, createIngester, postScan, familyOf, displayModel };

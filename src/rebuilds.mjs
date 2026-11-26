@@ -30,18 +30,20 @@ export function classify(requests, compactions, prices) {
   for (const r of requests) {
     if (r.model === "<synthetic>") continue;
     const key = `${r.session_id}\n${r.agent_id ?? ""}`;
-    (threads.get(key) ?? threads.set(key, []).get(key)).push(r);
+    let list = threads.get(key);
+    if (!list) threads.set(key, (list = []));
+    list.push({ r, at: Date.parse(r.ts) });
   }
   const out = new Map();
-  for (const list of threads.values()) {
-    list.sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts) || a.line - b.line);
+  for (const [key, list] of threads) {
+    list.sort((a, b) => a.at - b.at || a.r.line - b.r.line);
+    const comps = compactions.get(key) ?? [];
     let prev = null;
     let lifetime = SHORT_LIFETIME;
-    for (const r of list) {
-      const at = Date.parse(r.ts);
+    for (const { r, at } of list) {
       // The first request after a compaction rewrites the new short history while it still reads the system prompt and
       // tools from the cache, so it often writes less than half of what it carries: it counts once it rewrites enough.
-      const compacted = prev !== null && (compactions.get(`${r.session_id}\n${r.agent_id ?? ""}`) ?? []).some((c) => c > prev && c <= at);
+      const compacted = prev !== null && comps.some((c) => c > prev && c <= at);
       if (isRebuild(r) || (compacted && rewrittenTokens(r) >= MIN_REWRITE)) {
         const gap = prev === null ? null : Math.round((at - prev) / 1000);
         let cause;
@@ -60,12 +62,34 @@ export function classify(requests, compactions, prices) {
   return out;
 }
 
-// Recompute the rebuild columns of every request, writing only the rows that changed.
-export function markRebuilds(db, prices) {
-  const requests = db.prepare(`SELECT message_id, session_id, agent_id, ts, line, model, day, input, cache_read, cache_write, cache_write_1h,
-    rebuild, rebuild_gap, rebuild_extra FROM requests`).all();
+const CHUNK = 500;
+
+function queryBySessions(db, buildSql, sessions) {
+  const rows = [];
+  for (let i = 0; i < sessions.length; i += CHUNK) {
+    const slice = sessions.slice(i, i + CHUNK);
+    const placeholders = slice.map(() => "?").join(",");
+    for (const r of db.prepare(buildSql(placeholders)).all(...slice)) rows.push(r);
+  }
+  return rows;
+}
+
+// Recompute the rebuild columns of requests (all or only `dirtySessions`), writing only the rows that changed.
+export function markRebuilds(db, prices, dirtySessions = null) {
+  if (dirtySessions instanceof Set && dirtySessions.size === 0) return;
+  const reqCols = "message_id, session_id, agent_id, ts, line, model, day, input, cache_read, cache_write, cache_write_1h, rebuild, rebuild_gap, rebuild_extra";
+  let requests;
+  let compRows;
+  if (dirtySessions instanceof Set) {
+    const list = [...dirtySessions];
+    requests = queryBySessions(db, (ph) => `SELECT ${reqCols} FROM requests WHERE session_id IN (${ph})`, list);
+    compRows = queryBySessions(db, (ph) => `SELECT session_id, agent_id, ts FROM compactions WHERE ts IS NOT NULL AND session_id IN (${ph})`, list);
+  } else {
+    requests = db.prepare(`SELECT ${reqCols} FROM requests`).all();
+    compRows = db.prepare("SELECT session_id, agent_id, ts FROM compactions WHERE ts IS NOT NULL").all();
+  }
   const compactions = new Map();
-  for (const c of db.prepare("SELECT session_id, agent_id, ts FROM compactions WHERE ts IS NOT NULL").all()) {
+  for (const c of compRows) {
     const key = `${c.session_id}\n${c.agent_id ?? ""}`;
     (compactions.get(key) ?? compactions.set(key, []).get(key)).push(Date.parse(c.ts));
   }

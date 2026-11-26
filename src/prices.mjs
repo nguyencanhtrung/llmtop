@@ -32,17 +32,37 @@ export function readPrices(config) {
   return { rows, errors };
 }
 
+const PRICE_INDEX = new WeakMap();
+
+function indexPrices(rows) {
+  let entry = PRICE_INDEX.get(rows);
+  if (!entry || entry.len !== rows.length) {
+    const byModel = new Map();
+    for (const r of rows) {
+      let list = byModel.get(r.model);
+      if (!list) byModel.set(r.model, (list = []));
+      list.push(r);
+    }
+    entry = { len: rows.length, byModel };
+    PRICE_INDEX.set(rows, entry);
+  }
+  return entry.byModel;
+}
+
 // The row in force for a model id on a local day; strips context suffixes, effort suffixes and date snapshots.
 export function priceAt(rows, model, day) {
+  const byModel = indexPrices(rows);
   const noCtx = model.replace(/\[.*\]$/, "");
   const noEff = noCtx.replace(/-(?:low|medium|high|xhigh|max)$/, "");
   const noDate = noCtx.replace(/-(?:\d{4}-\d{2}-\d{2}|\d{8})$/, "");
   const bare = noEff.replace(/-(?:\d{4}-\d{2}-\d{2}|\d{8})$/, "");
   for (const id of new Set([model, noCtx, noEff, noDate, bare])) {
+    const cand = byModel.get(id);
+    if (!cand) continue;
     let hit = null;
-    for (const r of rows) if (r.model === id && r.from <= day && (!hit || r.from > hit.from)) hit = r;
+    for (const r of cand) if (r.from <= day && (!hit || r.from > hit.from)) hit = r;
     if (hit) return hit;
-    if (rows.some((r) => r.model === id)) return null;
+    return null;
   }
   return null;
 }

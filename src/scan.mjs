@@ -42,17 +42,22 @@ export async function scan(config, { onProgress = () => {} } = {}) {
 
   const getFile = db.prepare("SELECT * FROM files WHERE provider = ? AND path = ?");
   const addFile = db.prepare("INSERT INTO files(provider, path, kind, session_id, agent_id) VALUES (?, ?, ?, ?, ?)");
-  const saveCursor = db.prepare("UPDATE files SET offset = ?, lines = ?, head_hash = ?, archive_size = ?, first_ts = coalesce(first_ts, ?), cwd = coalesce(cwd, ?), live = ?, own_first = ?, own_last = ? WHERE id = ?");
-  const resetFile = db.prepare("UPDATE files SET generation = generation + 1, offset = 0, lines = 0, head_hash = NULL, archive_size = 0, first_ts = NULL, own_first = NULL, own_last = NULL, cwd = NULL WHERE id = ?");
+  const saveCursor = db.prepare("UPDATE files SET offset = ?, lines = ?, head_hash = ?, archive_size = ?, first_ts = coalesce(first_ts, ?), cwd = coalesce(cwd, ?), live = ?, own_first = ?, own_last = ?, ctime_ms = ? WHERE id = ?");
+  const resetFile = db.prepare("UPDATE files SET generation = generation + 1, offset = 0, lines = 0, head_hash = NULL, archive_size = 0, first_ts = NULL, own_first = NULL, own_last = NULL, cwd = NULL, ctime_ms = NULL WHERE id = ?");
+  const stampCtime = db.prepare("UPDATE files SET ctime_ms = ? WHERE id = ?");
+  const setOffline = db.prepare("UPDATE files SET live = 0 WHERE id = ?");
   const clear = FILE_TABLES.map((t) => db.prepare(`DELETE FROM ${t} WHERE file_id = ?`));
 
   const fileRow = (d) => getFile.get(d.provider, d.rel) ?? (addFile.run(d.provider, d.rel, d.kind, d.sessionId, d.agentId), getFile.get(d.provider, d.rel));
 
   // Every transcript a provider's host still has or its archive holds, oldest first.
+  const hostLists = new Map();
   const work = new Map();
   for (const p of providers) {
     const base = { provider: p.name, dir: p.archive };
-    for (const d of p.listHost(p.root).transcripts) if (!work.has(`${p.name}/${d.rel}`)) work.set(`${p.name}/${d.rel}`, { ...d, ...base, src: join(p.root, d.rel) });
+    const listed = p.listHost(p.root);
+    hostLists.set(p.name, listed);
+    for (const d of listed.transcripts) if (!work.has(`${p.name}/${d.rel}`)) work.set(`${p.name}/${d.rel}`, { ...d, ...base, src: join(p.root, d.rel) });
     for (const d of listArchived(p.archive, p.describe)) if (!work.has(`${p.name}/${d.rel}`)) work.set(`${p.name}/${d.rel}`, { ...d, ...base, src: null });
   }
   for (const d of work.values()) if (d.kind === "main") mains.add(d.sessionId);
@@ -66,9 +71,10 @@ export async function scan(config, { onProgress = () => {} } = {}) {
     const row = getFile.get(d.provider, d.rel);
     const src = d.src ?? archivePath(d.dir, d.rel);
     const stat = statSync(src);
-    const arcSize = sizeOf(archivePath(d.dir, d.rel)) ?? 0;
+    const arc = archivePath(d.dir, d.rel);
+    const arcSize = sizeOf(arc) ?? 0;
     const weight = (arcSize !== (row?.archive_size ?? 0) ? arcSize : 0) + (d.src ? Math.max(0, stat.size - (row?.offset ?? 0)) : 0);
-    jobs.push({ d, ts: row?.first_ts ?? (d.src ? peekFirstTs(d.src) : null) ?? "~", mtime: stat.mtimeMs, weight });
+    jobs.push({ d, row, stat, arc, arcSize, ts: row?.first_ts ?? (d.src ? peekFirstTs(d.src) : null) ?? "~", mtime: stat.mtimeMs, weight });
   }
   // A continuation starts with the same records as the file it continues, so ties go to the file last written first.
   jobs.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : a.mtime - b.mtime));
@@ -76,13 +82,39 @@ export async function scan(config, { onProgress = () => {} } = {}) {
   let bytes = 0, next = 0;
   const report = (done, extra = 0) => onProgress({ reason, step: "read", done, total: jobs.length, bytes: bytes + extra, totalBytes });
 
-  for (const [done, { d, weight }] of jobs.entries()) {
+  const dirtyFiles = new Set();
+  const dirtySessions = new Set();
+  const ctimeUpdates = [];
+  const offlineUpdates = [];
+  const nowMs = Date.now();
+  const safeCtime = (ms, refNow = Date.now()) => (ms !== null && (refNow - ms) > 2000 ? ms : null);
+
+  for (const [done, { d, row, stat, arc, arcSize, weight }] of jobs.entries()) {
     bytes = next;
     next += weight;
+
+    // Racy-clean fast-path: skip liveHead and newChunks for quiescent live files whose size and ctime match.
+    if (row && arcSize === row.archive_size && d.src && row.offset > 0 && stat.size === row.offset && row.ctime_ms !== null && row.ctime_ms === stat.ctimeMs && (nowMs - stat.ctimeMs) > 2000) {
+      if (done % 256 === 0) {
+        report(done);
+        await yieldToLoop();
+      }
+      continue;
+    }
+
+    // Fast-path for unchanged archived-only files.
+    if (row && arcSize === row.archive_size && !d.src) {
+      if (row.live) offlineUpdates.push(row.id);
+      if (done % 256 === 0) {
+        report(done);
+        await yieldToLoop();
+      }
+      continue;
+    }
+
     report(done);
     await yieldToLoop();
-    let file = fileRow(d);
-    const arc = archivePath(d.dir, d.rel);
+    let file = row ?? fileRow(d);
     const ingest = ingesters.get(d.provider);
     let firstTs = null;
     let cwd = null;
@@ -101,13 +133,13 @@ export async function scan(config, { onProgress = () => {} } = {}) {
 
     // The archive is ahead of the cursor when a scan died between the append and the commit,
     // or when the database was rebuilt: ingest what the archive holds beyond the cursor, in batches.
-    const arcSize = sizeOf(arc) ?? 0;
     if (arcSize !== file.archive_size) {
       if (arcSize < file.archive_size) throw new Error(`archive ${arc} is shorter than recorded; refusing to continue`);
       let { offset, lines } = file;
       const head = [];
       let headBytes = 0;
       let batch = 0;
+      const curCtime = d.src ? safeCtime(stat.ctimeMs) : null;
       db.exec("BEGIN");
       try {
         for await (const l of archiveLines(arc)) {
@@ -120,26 +152,36 @@ export async function scan(config, { onProgress = () => {} } = {}) {
           offset += l.bytes;
           lines = l.line;
           if (++batch % 5000 === 0) {
-            saveCursor.run(offset, lines, hashHead(Buffer.concat(head)), file.archive_size, firstTs, cwd, file.live, ownFirst, ownLast, file.id);
+            ingest.flush?.(file.id);
+            saveCursor.run(offset, lines, hashHead(Buffer.concat(head)), file.archive_size, firstTs, cwd, file.live, ownFirst, ownLast, curCtime, file.id);
             db.exec("COMMIT");
             db.exec("BEGIN");
           }
         }
-        saveCursor.run(offset, lines, hashHead(Buffer.concat(head)), arcSize, firstTs, cwd, d.src ? 1 : 0, ownFirst, ownLast, file.id);
+        ingest.flush?.(file.id);
+        saveCursor.run(offset, lines, hashHead(Buffer.concat(head)), arcSize, firstTs, cwd, d.src ? 1 : 0, ownFirst, ownLast, curCtime, file.id);
         db.exec("COMMIT");
       } catch (err) {
         db.exec("ROLLBACK");
         throw err;
       }
+      dirtyFiles.add(file.id);
+      dirtySessions.add(file.session_id);
       file = getFile.get(d.provider, d.rel);
     }
 
     if (!d.src) {
-      if (file.live) db.prepare("UPDATE files SET live = 0 WHERE id = ?").run(file.id);
+      if (file.live) offlineUpdates.push(file.id);
       continue;
     }
-    const size = sizeOf(d.src);
-    if (size === null) continue;
+    let curStat;
+    try {
+      curStat = statSync(d.src);
+    } catch {
+      continue;
+    }
+    const size = curStat.size;
+    const ctimeMs = curStat.ctimeMs;
 
     // A file that shrank or whose consumed head changed was rewritten: keep the old copy as a generation.
     if (file.offset > 0 && (size < file.offset || liveHead(d.src, file.offset) !== file.head_hash)) {
@@ -148,7 +190,10 @@ export async function scan(config, { onProgress = () => {} } = {}) {
         for (const c of clear) c.run(file.id);
         resetFile.run(file.id);
       });
+      ingest.reset?.(file.id);
       totals.generations++;
+      dirtyFiles.add(file.id);
+      dirtySessions.add(file.session_id);
       file = getFile.get(d.provider, d.rel);
       firstTs = cwd = ownFirst = ownLast = null;
     }
@@ -158,6 +203,7 @@ export async function scan(config, { onProgress = () => {} } = {}) {
       const archived = appendChunk(arc, chunk);
       const count = lineCount(chunk);
       const text = chunk.toString("utf8");
+      const stamped = safeCtime(ctimeMs);
       transaction(db, () => {
         let start = 0;
         for (let i = 0; i < count; i++) {
@@ -167,13 +213,27 @@ export async function scan(config, { onProgress = () => {} } = {}) {
         }
         offset += chunk.length;
         lines += count;
-        saveCursor.run(offset, lines, liveHead(d.src, offset), archived, firstTs, cwd, 1, ownFirst, ownLast, file.id);
+        ingest.flush?.(file.id);
+        saveCursor.run(offset, lines, liveHead(d.src, offset), archived, firstTs, cwd, 1, ownFirst, ownLast, stamped, file.id);
       });
       totals.bytes += chunk.length;
+      dirtyFiles.add(file.id);
+      dirtySessions.add(file.session_id);
       report(done, Math.max(0, weight - (size - offset)));
       await yieldToLoop();
     }
-    if (offset > file.offset) totals.files++;
+    if (offset > file.offset) {
+      totals.files++;
+    } else if (offset === file.offset && file.offset > 0 && file.ctime_ms !== ctimeMs) {
+      const stamped = safeCtime(ctimeMs);
+      if (stamped !== null) ctimeUpdates.push([stamped, file.id]);
+    }
+  }
+  if (ctimeUpdates.length || offlineUpdates.length) {
+    transaction(db, () => {
+      for (const [ms, id] of ctimeUpdates) stampCtime.run(ms, id);
+      for (const id of offlineUpdates) setOffline.run(id);
+    });
   }
   onProgress({ reason, step: "finish", done: jobs.length, total: jobs.length, bytes: totalBytes, totalBytes });
   await yieldToLoop();
@@ -181,23 +241,45 @@ export async function scan(config, { onProgress = () => {} } = {}) {
   // Other session-folder files; the subagent meta files among them give each subagent its type.
   const activeProviders = new Set(jobs.map((j) => j.d.provider));
   const copied = new Set();
+  const copiedMeta = new Set();
   for (const p of providers) {
-    for (const rel of p.listHost(p.root).others) {
+    for (const rel of hostLists.get(p.name).others) {
       if (copied.has(`${p.name}/${rel}`)) continue;
       copied.add(`${p.name}/${rel}`);
-      if (copyOther(join(p.root, rel), join(p.archive, rel))) totals.copied++;
+      if (copyOther(join(p.root, rel), join(p.archive, rel))) {
+        totals.copied++;
+        copiedMeta.add(`${p.name}/${rel}`);
+      }
     }
     if (p.syncMeta && activeProviders.has(p.name)) totals.copied += p.syncMeta(p.root, p.archive) ?? 0;
   }
+  const existingSubs = new Map(db.prepare("SELECT agent_id, session_id, type, tool_use_id FROM subagents").all().map((s) => [s.agent_id, s]));
   const putSub = db.prepare("INSERT OR REPLACE INTO subagents(agent_id, session_id, type, tool_use_id) VALUES (?, ?, ?, ?)");
-  for (const { d } of jobs) {
+  const subUpdates = [];
+  for (const { d, row } of jobs) {
     if (d.kind !== "sub") continue;
+    const known = existingSubs.get(d.agentId);
+    const metaRel = `${d.provider}/${d.rel.replace(/\.jsonl$/, ".meta.json")}`;
+    if (known && !(row && dirtyFiles.has(row.id)) && !copiedMeta.has(metaRel)) continue;
     const meta = PROVIDERS[d.provider].subagentMeta?.(d.dir, d);
-    if (meta) putSub.run(d.agentId, d.sessionId, meta.type, meta.toolUseId);
+    if (!meta) continue;
+    if (!known || known.session_id !== d.sessionId || known.type !== meta.type || known.tool_use_id !== meta.toolUseId) {
+      subUpdates.push([d.agentId, d.sessionId, meta.type, meta.toolUseId]);
+      dirtySessions.add(d.sessionId);
+    }
   }
-  for (const p of providers) if (activeProviders.has(p.name)) p.postScan?.(db, p.archive);
+  if (subUpdates.length) {
+    transaction(db, () => {
+      for (const args of subUpdates) putSub.run(...args);
+    });
+  }
+  for (const p of providers) {
+    if (!activeProviders.has(p.name)) continue;
+    const d = p.postScan?.(db, p.archive);
+    if (d) for (const s of d) dirtySessions.add(s);
+  }
 
-  derive(db, config);
+  derive(db, config, { dirtySessions, full: reason !== "update" });
   const sessionsAfter = db.prepare("SELECT COUNT(DISTINCT session_id) n FROM files WHERE kind = 'main' AND lines > 0").get().n;
   totals.sessions = sessionsAfter - sessionsBefore;
   totals.prices = { report: priceReport(db), errors: readPrices(config).errors };

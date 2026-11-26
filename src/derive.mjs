@@ -1,4 +1,5 @@
 // Per-session values computed after every scan from the ingested rows. Cheap: one pass over sessions.
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -11,6 +12,14 @@ const IGNORE_GIT_ROOTS = new Set(["/", homedir(), tmpdir(), "/tmp", "/var/tmp"])
 const GENERIC_DIR_RE = /^(?:repo|src|worktree|checkout|tmp|temp|home|code|docs|tests|test|scripts|tools)$/i;
 const validRepoName = (n) => Boolean(n && n.length >= 3 && !n.startsWith(".") && !GENERIC_DIR_RE.test(n));
 const inTmpDir = (p) => p.startsWith(tmpdir() + sep) || p.startsWith("/tmp/") || p.startsWith("/var/tmp/");
+
+const checkExists = (p, existsCache) => {
+  if (!existsCache) return existsSync(p);
+  if (existsCache.has(p)) return existsCache.get(p);
+  const v = existsSync(p);
+  existsCache.set(p, v);
+  return v;
+};
 
 function manifestNameOf(dir) {
   try {
@@ -75,15 +84,29 @@ function resolveGitDirName(dir, gitDir, depth = 0) {
   return base;
 }
 
-function gitRepoOf(p) {
-  if (!p || !existsSync(p)) return null;
+function gitRepoOf(p, gitCache = null, existsCache = null) {
+  if (!p) return null;
+  if (gitCache?.has(p)) return gitCache.get(p);
+  const save = (val) => {
+    gitCache?.set(p, val);
+    return val;
+  };
+  if (!checkExists(p, existsCache)) return save(null);
   let dir = p;
   try {
     if (!statSync(dir).isDirectory()) dir = dirname(dir);
   } catch {
-    return null;
+    return save(null);
   }
+  if (dir !== p && gitCache?.has(dir)) return save(gitCache.get(dir));
+  const walked = [];
+  let hit = null;
   for (; ; dir = dirname(dir)) {
+    if (gitCache?.has(dir)) {
+      hit = gitCache.get(dir);
+      break;
+    }
+    walked.push(dir);
     if (!IGNORE_GIT_ROOTS.has(dir)) {
       const g = join(dir, ".git");
       if (existsSync(g)) {
@@ -98,28 +121,32 @@ function gitRepoOf(p) {
                 const mainRoot = wt[1];
                 let name = resolveGitDirName(mainRoot, join(mainRoot, ".git"));
                 if (GENERIC_DIR_RE.test(name)) name = manifestNameOf(dir) || name;
-                return { root: mainRoot, name };
+                hit = { root: mainRoot, name };
+                break;
               }
             }
           } else if (st.isDirectory()) {
-            return { root: dir, name: resolveGitDirName(dir, g) };
+            hit = { root: dir, name: resolveGitDirName(dir, g) };
+            break;
           }
         } catch { /* unreadable .git metadata; fall back to dir name */ }
-        return { root: dir, name: basename(dir) };
+        hit = { root: dir, name: basename(dir) };
+        break;
       }
     }
     if (dirname(dir) === dir) break;
   }
-  return null;
+  for (const w of walked) gitCache?.set(w, hit);
+  return save(hit);
 }
 
 // The nearest directory at or above cwd that holds .git (skipping root/home/tmp, resolving worktrees/temp clones), else cwd's own name.
 // onDisk tells whether cwd still exists, so a session whose folder is gone keeps the project it had without climbing parent repos.
-export function projectOf(cwd) {
+export function projectOf(cwd, gitCache = null, existsCache = null) {
   if (!cwd) return null;
-  const onDisk = existsSync(cwd);
+  const onDisk = checkExists(cwd, existsCache);
   if (onDisk) {
-    const g = gitRepoOf(cwd);
+    const g = gitRepoOf(cwd, gitCache, existsCache);
     if (g) return { name: g.name, onDisk: true };
   }
   return { name: basename(cwd) || "(no project)", onDisk };
@@ -152,13 +179,13 @@ function matchFallbackPath(dir, cwdRepo, knownRepos, sortedKnown) {
   return null;
 }
 
-function resolveSessionProject(cwd, repoUrl, pathWeights, existingProject, knownRepos, sortedKnown) {
-  const cwdRepo = cwd ? gitRepoOf(cwd) : null;
+function resolveSessionProject(cwd, repoUrl, pathWeights, existingProject, knownRepos, sortedKnown, gitCache, existsCache) {
+  const cwdRepo = cwd ? gitRepoOf(cwd, gitCache, existsCache) : null;
   const urlRepo = repoFromUrl(repoUrl);
   const byRepo = new Map();
   for (const [dir, [w, r]] of Object.entries(pathWeights ?? {})) {
-    let name = gitRepoOf(dir)?.name ?? null;
-    if (!name && (!existsSync(dir) || inTmpDir(dir))) name = matchFallbackPath(dir, cwdRepo, knownRepos, sortedKnown);
+    let name = gitRepoOf(dir, gitCache, existsCache)?.name ?? null;
+    if (!name && (!checkExists(dir, existsCache) || inTmpDir(dir))) name = matchFallbackPath(dir, cwdRepo, knownRepos, sortedKnown);
     if (!name) continue;
     const cur = byRepo.get(name) ?? { name, w: 0, r: 0 };
     cur.w += w;
@@ -189,7 +216,7 @@ function resolveSessionProject(cwd, repoUrl, pathWeights, existingProject, known
     return cwdRepo.name;
   }
   if (urlRepo) return urlRepo;
-  const p = projectOf(cwd);
+  const p = projectOf(cwd, gitCache, existsCache);
   if (p && !p.onDisk) {
     const segHit = matchSeg(basename(cwd), new Set(), knownRepos, sortedKnown);
     if (segHit) return segHit;
@@ -198,8 +225,52 @@ function resolveSessionProject(cwd, repoUrl, pathWeights, existingProject, known
 }
 
 const firstLine = (text) => text.split("\n").find((l) => l.trim())?.trim().slice(0, 80) ?? null;
+const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 
-export function derive(db, config) {
+function expandDirtySessions(db, dirtySessions) {
+  const expanded = new Set(dirtySessions);
+  const dependents = new Map();
+  const addEdge = (prev, next) => {
+    if (!prev || !next || prev === next) return;
+    let set = dependents.get(prev);
+    if (!set) dependents.set(prev, (set = new Set()));
+    set.add(next);
+  };
+  for (const r of db.prepare("SELECT id, carried_from FROM sessions WHERE carried_from IS NOT NULL").all()) {
+    addEdge(r.carried_from, r.id);
+  }
+  for (const r of db.prepare(`SELECT DISTINCT f.session_id id, q.session_id prev_id FROM repeats p
+    JOIN requests q ON q.message_id = p.message_id JOIN files f ON f.id = p.file_id AND f.kind = 'main'`).all()) {
+    addEdge(r.prev_id, r.id);
+  }
+  const queue = [...expanded];
+  while (queue.length) {
+    const cur = queue.pop();
+    const nexts = dependents.get(cur);
+    if (!nexts) continue;
+    for (const n of nexts) {
+      if (!expanded.has(n)) {
+        expanded.add(n);
+        queue.push(n);
+      }
+    }
+  }
+  return expanded;
+}
+
+export function derive(db, config, { dirtySessions = null, full = false } = {}) {
+  const pricesText = existsSync(config.prices) ? readFileSync(config.prices, "utf8") : "";
+  const deriveKey = sha256(`${config.timeZone}\n${pricesText}`);
+  const getMeta = db.prepare("SELECT value FROM meta WHERE key = ?");
+  const putMeta = db.prepare("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+  const prevKey = getMeta.get("derive_key")?.value;
+  const forceFull = full || dirtySessions === null || prevKey !== deriveKey;
+  if (!forceFull && dirtySessions.size === 0) return;
+
+  const expandedDirty = forceFull ? null : expandDirtySessions(db, dirtySessions);
+  const gitCache = new Map();
+  const existsCache = new Map();
+
   const files = db.prepare("SELECT id, provider, session_id, path, cwd, own_first first_ts, own_last last_ts FROM files WHERE kind = 'main'").all();
   const existing = new Map(db.prepare("SELECT id, project FROM sessions").all().map((s) => [s.id, s.project]));
   const titles = db.prepare("SELECT kind, title FROM titles WHERE file_id = ? ORDER BY line DESC");
@@ -207,7 +278,7 @@ export function derive(db, config) {
   const lastCost = db.prepare("SELECT * FROM cost_states WHERE file_id = ? ORDER BY line DESC LIMIT 1");
   const knownRepos = new Set();
   for (const f of files) {
-    const g = f.cwd ? gitRepoOf(f.cwd) : null;
+    const g = f.cwd ? gitRepoOf(f.cwd, gitCache, existsCache) : null;
     if (g && validRepoName(g.name)) knownRepos.add(g.name);
   }
   const sessionMeta = new Map();
@@ -234,13 +305,18 @@ export function derive(db, config) {
           const prev = cur.pathWeights[dir] ?? (cur.pathWeights[dir] = [0, 0]);
           prev[0] += Number(pair[0]) || 0;
           prev[1] += Number(pair[1]) || 0;
-          const g = gitRepoOf(dir);
+          const g = gitRepoOf(dir, gitCache, existsCache);
           if (g && validRepoName(g.name)) knownRepos.add(g.name);
         }
       } catch { /* ignore malformed json */ }
     }
   }
   const sortedKnown = [...knownRepos].sort((a, b) => b.length - a.length);
+  const knownReposHash = sha256(sortedKnown.join("\n"));
+  const prevReposHash = getMeta.get("known_repos_hash")?.value;
+  const deriveAll = forceFull || knownReposHash !== prevReposHash;
+  const targetFiles = deriveAll ? files : files.filter((f) => expandedDirty.has(f.session_id));
+
   // The session this file continues or forks: of the sessions owning the requests it repeats, the latest to start.
   // CROSS JOIN keeps the order from the file's few repeats; left to the planner it scanned every file and request per file.
   const predecessor = db.prepare(`SELECT f.session_id id FROM repeats p CROSS JOIN requests q ON q.message_id = p.message_id
@@ -258,21 +334,26 @@ export function derive(db, config) {
       api_ms = excluded.api_ms, tool_ms = excluded.tool_ms, lines_added = excluded.lines_added, lines_removed = excluded.lines_removed,
       carried_from = excluded.carried_from, model_cost = excluded.model_cost, model_tokens = excluded.model_tokens`);
 
+  const fileBySession = new Map(files.map((f) => [f.session_id, f]));
   const raw = new Map();
-  for (const f of files) {
-    const c = lastCost.get(f.id);
-    raw.set(f.session_id, c ? { ...c, models: JSON.parse(c.model_usage) } : null);
-  }
+  const rawOf = (sessionId) => {
+    if (raw.has(sessionId)) return raw.get(sessionId);
+    const f = fileBySession.get(sessionId);
+    const c = f ? lastCost.get(f.id) : null;
+    const val = c ? { ...c, models: JSON.parse(c.model_usage) } : null;
+    raw.set(sessionId, val);
+    return val;
+  };
 
   db.exec("BEGIN");
   try {
-    for (const f of files) {
+    for (const f of targetFiles) {
       const ms = sessionMeta.get(f.session_id);
-      const project = resolveSessionProject(f.cwd, ms?.repo_url ?? null, ms?.pathWeights ?? null, existing.get(f.session_id), knownRepos, sortedKnown);
+      const project = resolveSessionProject(f.cwd, ms?.repo_url ?? null, ms?.pathWeights ?? null, existing.get(f.session_id), knownRepos, sortedKnown, gitCache, existsCache);
       const t = titles.all(f.id);
       const title = t.find((x) => x.kind === "custom")?.title ?? t.find((x) => x.kind === "ai")?.title ?? (firstOwner.get(f.session_id)?.text ? firstLine(firstOwner.get(f.session_id).text) : null);
 
-      const c = raw.get(f.session_id);
+      const c = rawOf(f.session_id);
       let cost = null;
       let models = null;
       let tokens = null;
@@ -289,7 +370,7 @@ export function derive(db, config) {
         // A host record that started with the earlier session's record is cumulative and holds all of it;
         // a fork or a resume in a new process starts its own record shortly before its first own line.
         const earlier = predecessor.get(f.id, f.session_id);
-        prev = earlier ? raw.get(earlier.id) : null;
+        prev = earlier ? rawOf(earlier.id) : null;
         if (prev && c.start_ms !== null && prev.start_ms !== null && c.start_ms <= prev.start_ms + 1000) {
           carriedFrom = earlier.id;
           const less = (v, w) => (v === null ? null : Math.max(0, v - (w ?? 0)));
@@ -337,10 +418,12 @@ export function derive(db, config) {
       upsert.run(f.session_id, f.provider, f.path.split(sep)[0], f.cwd, project, title, f.first_ts, f.last_ts, cost,
         c ? (c.incomplete ? 1 : 0) : null, estimated, check ? JSON.stringify(check) : null, api, tool, added, removed, carriedFrom, models ? JSON.stringify(models) : null, tokens ? JSON.stringify(tokens) : null);
     }
+    putMeta.run("derive_key", deriveKey);
+    putMeta.run("known_repos_hash", knownReposHash);
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
   }
-  markRebuilds(db, prices);
+  markRebuilds(db, prices, forceFull ? null : expandedDirty);
 }
