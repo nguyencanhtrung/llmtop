@@ -97,11 +97,25 @@ llmtop usage [--days n | --since d --until d] [--by day|model|provider|effort|pr
              [--provider name] [--project name] [--model family] [--effort level] [--json]
 llmtop prices [--json]                    # Verify prices.md against host cost records
 llmtop show <session>:<line>              # Print one archived record
-llmtop update [--check] [--json]          # Check npmjs or upgrade to the latest release
+llmtop update [--check] [--json] [--force] # Check npmjs or upgrade to the latest release
 llmtop uninstall [--purge] [--dry-run] [--yes]
                                           # Stop llmtop and remove the global installation
 llmtop --help | --version
 ```
+
+## Update & Uninstall
+
+```bash
+llmtop update --check          # Check npmjs for a newer release (supports --json)
+llmtop update                  # Upgrade the global installation to the latest release
+llmtop stop                    # Stop a running llmtop serve process
+llmtop uninstall --dry-run     # Preview what uninstall will stop, remove, or keep
+llmtop uninstall               # Stop llmtop and remove the global package (keeps ~/.config/llmtop)
+llmtop uninstall --purge       # Also remove ~/.config/llmtop (config, archive, and usage.db)
+```
+
+- **`llmtop update`** queries `registry.npmjs.org` only when invoked (never in the background), detects your global package manager (`npm`, `pnpm`, `yarn`, or `bun`), and warns if `llmtop serve` is running so you can restart it afterward. From a local Git checkout or `npx`, it prints manual steps unless `--force` is passed.
+- **`llmtop uninstall`** stops running `llmtop serve` processes, removes the global package, and asks for confirmation in interactive terminals (pass `--yes` or `-y` in scripts). By default it keeps `~/.config/llmtop`; add `--purge` to delete local config, archive, and SQLite data. Original provider transcripts (`~/.claude`, `~/.codex`, `~/.gemini/antigravity-cli`) are never touched.
 
 ## Configuration
 
