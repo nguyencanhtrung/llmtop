@@ -20,8 +20,9 @@ Run `make test` and `make check` after every change; `make build` when the dashb
 
 | Path | Holds |
 | --- | --- |
-| `bin/llmtop.mjs` | CLI entry: scan, show, usage, prices, serve |
+| `bin/llmtop.mjs` | CLI entry: scan, show, usage, prices, serve, stop, update, uninstall |
 | `src/config.mjs` | Optional config (`~/.config/llmtop/config.json` by default, or `./llmtop.config.json` if present locally) and defaults (`~/.config/llmtop/data/`); unknown keys pass through |
+| `src/process.mjs`, `src/install.mjs`, `src/update.mjs`, `src/uninstall.mjs` | Server runtime state (`serve.json`) and `stop`, install-mode detection, explicit npmjs `update`, and `uninstall` |
 | `src/providers/` | One module per transcript source (`claude.mjs`, `codex.mjs`, `agy.mjs`); `index.mjs` lists them |
 | `src/archive.mjs`, `src/scan.mjs` | Append-only copy of each provider's transcripts under `data/archive/<provider>/`, then ingest |
 | `src/db.mjs` | Schema of `data/usage.db`; bump `SCHEMA_VERSION` on any change and the database is rebuilt from the archive |
@@ -35,7 +36,7 @@ Run `make test` and `make check` after every change; `make build` when the dashb
 
 ## Constraints
 
-- Nothing leaves the machine: the server binds `127.0.0.1`, and no code makes a network request.
+- Nothing leaves the machine: the server binds `127.0.0.1`, and no code makes background network requests (`llmtop update` contacts npmjs only when explicitly run).
 - The archive is append-only and keeps line numbers stable; never rewrite or delete archived lines.
 - Provider-specific parsing stays in `src/providers/<name>.mjs`; a new provider is a new module plus its entry in `index.mjs` and the config docs.
 - Tests and examples use synthetic data only. Never read `~/.claude`, never commit `data/`, real transcripts, project names or absolute home paths.

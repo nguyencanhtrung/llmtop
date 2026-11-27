@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig, ROOT } from "../src/config.mjs";
+import { defaultConfigDir, defaultConfigPath, loadConfig, ROOT } from "../src/config.mjs";
 import { localTime } from "../src/format.mjs";
 import { pricesCommand } from "../src/prices-command.mjs";
+import { stopCommand, writeServerState } from "../src/process.mjs";
 import { scan, scanReport } from "../src/scan.mjs";
 import { serve } from "../src/serve.mjs";
 import { show } from "../src/show.mjs";
+import { uninstallCommand } from "../src/uninstall.mjs";
+import { updateCommand } from "../src/update.mjs";
 import { usageCommand } from "../src/usage-command.mjs";
 
 const { version: VERSION } = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
@@ -19,13 +22,29 @@ const USAGE = `usage: llmtop <command> [options]
         [--provider name] [--project name] [--model family] [--effort level]
   prices                                the price table checked against the host's cost records
   serve [--port n]                      the built dashboard on http://localhost:<port>
+  stop                                  stop the running llmtop serve process
+  update [--check] [--force]            check npmjs or upgrade llmtop to the latest version
+  uninstall [--purge] [--dry-run] [--yes]
+                                        stop llmtop and remove the global installation
 
 Options:
   -h, --help                            show this help message
   -v, --version                         show version (${VERSION})
 
-Listing commands accept --json. Config and data default to ~/.config/llmtop
+Listing commands and update --check accept --json. Config and data default to ~/.config/llmtop
 (override with LLMTOP_CONFIG and LLMTOP_DATA).`;
+
+function loadConfigOrDefault() {
+  try {
+    return loadConfig();
+  } catch {
+    return {
+      configPath: defaultConfigPath(),
+      data: process.env.LLMTOP_DATA || join(defaultConfigDir(), "data"),
+      providers: {},
+    };
+  }
+}
 
 const COMMANDS = {
   async scan({ config, out }) {
@@ -42,18 +61,38 @@ const COMMANDS = {
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError(`--port needs a port number, got ${options.port}`);
     const at = localTime(config.timeZone);
     const server = await serve(config, { port, onScan: (t) => reportScan(t, out, `${at(new Date().toISOString())}  `) });
+    const cleanup = writeServerState(config, { pid: process.pid, port: server.address().port, version: VERSION });
+    server.once("close", cleanup);
+    let closing = false;
+    const shutdown = () => {
+      if (closing) return;
+      closing = true;
+      cleanup();
+      server.closeAllConnections?.();
+      server.close(() => process.exit(0));
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
     out.write(`dashboard at http://localhost:${server.address().port}: its Refresh button scans again, Ctrl+C to stop\n`);
   },
   prices: pricesCommand,
+  stop: stopCommand,
+  update: updateCommand,
+  uninstall: uninstallCommand,
 };
 
 // Options are --name value or --flag; FLAGS lists the ones without a value.
-const FLAGS = new Set(["json"]);
+const FLAGS = new Set(["json", "check", "force", "purge", "dry-run", "yes"]);
+const LENIENT_CONFIG_COMMANDS = new Set(["stop", "update", "uninstall"]);
 function parseArgs(argv) {
   const positional = [];
   const options = {};
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "-y") {
+      options.yes = true;
+      continue;
+    }
     if (!arg.startsWith("--")) {
       positional.push(arg);
       continue;
@@ -90,7 +129,8 @@ async function main(argv) {
     return 2;
   }
   const { positional, options } = parseArgs(rest);
-  return (await run({ config: loadConfig(), positional, options, out: process.stdout })) ?? 0;
+  const config = LENIENT_CONFIG_COMMANDS.has(command) ? loadConfigOrDefault() : loadConfig();
+  return (await run({ config, positional, options, out: process.stdout })) ?? 0;
 }
 
 try {

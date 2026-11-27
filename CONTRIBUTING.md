@@ -73,7 +73,7 @@ A merge commit is the default; squash only when the branch history is not worth 
 
 ## Rules for the code
 
-- **Nothing leaves the machine.** The server listens on `127.0.0.1`; the page and the CLI make no network request.
+- **Nothing leaves the machine.** The server listens on `127.0.0.1`; the page and the CLI make no background network requests (`llmtop update` contacts npmjs only when explicitly run).
 - **The archive is append-only.** A transcript line keeps its line number forever, so `session:line` references stay valid. Never rewrite or delete archived lines.
 - **The database is disposable.** It is rebuilt from the archive whenever `SCHEMA_VERSION` in `src/db.mjs` changes; bump it with every schema change.
 - **One provider, one module.** Everything that knows a tool's transcript format lives in `src/providers/<name>.mjs` and is listed in `src/providers/index.mjs`. Generic code never parses a provider's records.
