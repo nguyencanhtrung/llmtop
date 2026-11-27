@@ -18,6 +18,9 @@ test("--help and --version print expected output and exit zero", () => {
     const r = home.run(flag);
     assert.equal(r.code, 0, flag);
     assert.match(r.stdout, /^usage: llmtop/, flag);
+    assert.match(r.stdout, /\bstop\b/, flag);
+    assert.match(r.stdout, /\bupdate\b/, flag);
+    assert.match(r.stdout, /\buninstall\b/, flag);
   }
   for (const flag of ["-v", "--version", "version"]) {
     const r = home.run(flag);

@@ -29,7 +29,7 @@ llmtop serve
 
 Or run without installing: `npx llmtop serve`. Open <http://localhost:4310>.
 
-- **Local-only:** Binds `127.0.0.1` only; zero telemetry, zero outbound requests, zero runtime npm dependencies.
+- **Local-only:** Binds `127.0.0.1` only; zero telemetry, zero background network requests (only `llmtop update` contacts npmjs when invoked), zero runtime npm dependencies.
 - **Zero setup:** Automatically reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.gemini/antigravity-cli`, skipping absent tools.
 - **Persistent archive:** Copies transcripts into append-only `.jsonl.zst` frames and indexes them into SQLite (`node:sqlite`) under `~/.config/llmtop/data/`. Requires **Node.js 22.15+**.
 
@@ -91,11 +91,15 @@ CLI and dashboard totals stay identical for the same window and filters (`--json
 
 ```bash
 llmtop serve [--port n]                   # Dashboard at http://localhost:4310
+llmtop stop                               # Stop the running dashboard server
 llmtop scan                               # Archive new transcript lines into usage.db
 llmtop usage [--days n | --since d --until d] [--by day|model|provider|effort|project|session|hour|tool|skill|subagent]
              [--provider name] [--project name] [--model family] [--effort level] [--json]
 llmtop prices [--json]                    # Verify prices.md against host cost records
 llmtop show <session>:<line>              # Print one archived record
+llmtop update [--check] [--json]          # Check npmjs or upgrade to the latest release
+llmtop uninstall [--purge] [--dry-run] [--yes]
+                                          # Stop llmtop and remove the global installation
 llmtop --help | --version
 ```
 
