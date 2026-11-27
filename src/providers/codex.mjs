@@ -222,6 +222,18 @@ function extractDollarSkills(text) {
   return [...seen];
 }
 
+const str = (v) => (typeof v === "string" && v ? v : null);
+const modelOf = (v) => str(v) ?? str(v?.model);
+function parseParserState(raw) {
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw);
+    return o && typeof o === "object" ? o : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createIngester(db, timeZone) {
   const zone = zoner(timeZone);
   const q = {
@@ -241,12 +253,17 @@ export function createIngester(db, timeZone) {
         subagent_type = COALESCE(excluded.subagent_type, file_meta.subagent_type),
         tool_use_id = COALESCE(excluded.tool_use_id, file_meta.tool_use_id),
         repo_url = COALESCE(excluded.repo_url, file_meta.repo_url)`),
-    getStats: db.prepare("SELECT api_ms, tool_ms, lines_added, lines_removed, target_paths FROM file_meta WHERE file_id = ?"),
+    getStats: db.prepare("SELECT api_ms, tool_ms, lines_added, lines_removed, target_paths, parser_state FROM file_meta WHERE file_id = ?"),
     upsertStats: db.prepare(`INSERT INTO file_meta(file_id, api_ms, tool_ms, lines_added, lines_removed) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(file_id) DO UPDATE SET api_ms = excluded.api_ms, tool_ms = excluded.tool_ms,
         lines_added = excluded.lines_added, lines_removed = excluded.lines_removed`),
     upsertTargetPaths: db.prepare(`INSERT INTO file_meta(file_id, target_paths) VALUES (?, ?)
       ON CONFLICT(file_id) DO UPDATE SET target_paths = excluded.target_paths`),
+    upsertParserState: db.prepare(`INSERT INTO file_meta(file_id, parser_state) VALUES (?, ?)
+      ON CONFLICT(file_id) DO UPDATE SET parser_state = excluded.parser_state`),
+    backfillReqModel: db.prepare("UPDATE requests SET model = ?, family = ? WHERE file_id = ? AND model = 'unknown'"),
+    backfillCallModel: db.prepare("UPDATE tool_calls SET model = ? WHERE file_id = ? AND model IS NULL"),
+    backfillReqEffort: db.prepare("UPDATE requests SET effort = ? WHERE file_id = ? AND effort IS NULL"),
   };
   const stateByFile = new Map();
 
@@ -261,17 +278,25 @@ export function createIngester(db, timeZone) {
     let st = stateByFile.get(file.id);
     if (!st) {
       const prevStats = file.lines > 0 ? q.getStats.get(file.id) : null;
+      const ps = parseParserState(prevStats?.parser_state);
       st = {
         launchCwd: file.cwd ?? null,
-        cwd: file.cwd ?? null,
-        model: null, effort: null, sawTokenRec: false, lastTotal: null, lastCompactionLine: -999,
+        cwd: str(ps?.cwd) ?? file.cwd ?? null,
+        model: str(ps?.model) ?? null,
+        effort: str(ps?.effort) ?? null,
+        sawTokenRec: Boolean(ps?.sawTokenRec),
+        lastTotal: str(ps?.lastTotal) ?? null,
+        lastCompactionLine: typeof ps?.lastCompactionLine === "number" ? ps.lastCompactionLine : -999,
         callStart: new Map(), callSkills: new Map(),
         turnStartMs: null, turnToolMs: 0, openApiMs: 0, lastWaitFromMs: null,
         completedApiMs: prevStats?.api_ms ?? 0, toolMs: prevStats?.tool_ms ?? 0,
         baseAdded: prevStats?.lines_added ?? 0, baseRemoved: prevStats?.lines_removed ?? 0,
-        sawFileChange: false, fcAdded: 0, fcRemoved: 0, patchAdded: 0, patchRemoved: 0,
+        sawFileChange: Boolean(ps?.sawFileChange),
+        fcAdded: 0, fcRemoved: 0, patchAdded: 0, patchRemoved: 0,
         paths: createPathTracker(prevStats?.target_paths ?? null),
-        statsDirty: false, pathsDirty: false,
+        hadUnknownModel: Boolean(ps?.hadUnknownModel),
+        hadNullEffort: Boolean(ps?.hadNullEffort),
+        statsDirty: false, pathsDirty: false, stateDirty: false,
       };
       stateByFile.set(file.id, st);
     }
@@ -285,6 +310,34 @@ export function createIngester(db, timeZone) {
     const tsMs = Number.isFinite(parsedTs) ? parsedTs : null;
     let cwd = p.cwd ?? null;
     let added = 0;
+
+    const setModel = (raw) => {
+      const next = modelOf(raw);
+      if (!next) return;
+      if (!st.model && st.hadUnknownModel) {
+        q.backfillReqModel.run(next, familyOf(next), file.id);
+        q.backfillCallModel.run(next, file.id);
+        st.hadUnknownModel = false;
+        st.stateDirty = true;
+      }
+      if (st.model !== next) {
+        st.model = next;
+        st.stateDirty = true;
+      }
+    };
+    const setEffort = (raw) => {
+      const next = str(raw);
+      if (!next) return;
+      if (!st.effort && st.hadNullEffort) {
+        q.backfillReqEffort.run(next, file.id);
+        st.hadNullEffort = false;
+        st.stateDirty = true;
+      }
+      if (st.effort !== next) {
+        st.effort = next;
+        st.stateDirty = true;
+      }
+    };
 
     const consumeOpenWait = () => {
       if (tsMs !== null && st.lastWaitFromMs !== null) {
@@ -310,6 +363,14 @@ export function createIngester(db, timeZone) {
       const output = u.output_tokens ?? 0;
       const thinking = u.reasoning_output_tokens ?? 0;
       if (!input && !output && !cacheRead && !cacheWrite) return false;
+      if (!st.model && !st.hadUnknownModel) {
+        st.hadUnknownModel = true;
+        st.stateDirty = true;
+      }
+      if (!st.effort && !st.hadNullEffort) {
+        st.hadNullEffort = true;
+        st.stateDirty = true;
+      }
       const model = st.model ?? "unknown";
       const { day, hour } = zone(ts);
       q.record.run(`codex:${ownId}:${line}`, file.id, line, rec.type, ts);
@@ -321,40 +382,52 @@ export function createIngester(db, timeZone) {
     if (rec.type === "session_meta") {
       if (p.cwd) {
         st.launchCwd ??= p.cwd;
-        st.cwd = p.cwd;
+        if (st.cwd !== p.cwd) {
+          st.cwd = p.cwd;
+          st.stateDirty = true;
+        }
       }
       const subType = subagentTypeOf(p.source);
       const metaSub = p.parent_thread_id || subType ? (subType ?? "subagent") : null;
       const repoUrl = p.git?.repository_url ?? null;
       if (metaSub || repoUrl) q.fileMeta.run(file.id, p.parent_thread_id ?? null, metaSub, null, repoUrl);
-      if (p.model) st.model = p.model;
+      setModel(p.model);
     } else if (rec.type === "turn_context") {
       if (p.cwd) {
         st.launchCwd ??= p.cwd;
-        st.cwd = p.cwd;
+        if (st.cwd !== p.cwd) {
+          st.cwd = p.cwd;
+          st.stateDirty = true;
+        }
         if (p.cwd !== st.launchCwd && st.paths.add(p.cwd, { write: false })) st.pathsDirty = true;
       }
-      if (p.model) st.model = p.model;
-      const eff = p.effort ?? p.collaboration_mode?.settings?.reasoning_effort;
-      if (eff) st.effort = eff;
+      setModel(p.model ?? p.collaboration_mode?.settings?.model);
+      setEffort(p.effort ?? p.collaboration_mode?.settings?.reasoning_effort);
     } else if (rec.type === "world_state") {
-      if (p.state?.model) st.model = p.state.model;
-      if (p.state?.effort) st.effort = p.state.effort;
+      setModel(modelOf(p.state?.model) ?? modelOf(p.state?.collaboration_mode?.model) ?? modelOf(p.state?.collaboration_mode?.settings?.model));
+      setEffort(p.state?.effort ?? p.state?.reasoning_effort ?? p.state?.collaboration_mode?.settings?.reasoning_effort);
     } else if (rec.type === "token_usage_record") {
       consumeOpenWait();
-      st.sawTokenRec = true;
+      if (!st.sawTokenRec) {
+        st.sawTokenRec = true;
+        st.stateDirty = true;
+      }
       const msgId = `codex:${p.response_id || `${ownId}:${line}`}`;
       if (recordUsage(msgId, p.usage)) added = 1;
     } else if (rec.type === "compacted") {
+      if (!st.model) setModel(p.resume_metadata?.previous_turn_settings?.model);
+      if (!st.effort) setEffort(p.resume_metadata?.previous_turn_settings?.reasoning_effort ?? p.resume_metadata?.previous_turn_settings?.effort);
       if (line - st.lastCompactionLine > 5) {
         st.lastCompactionLine = line;
+        st.stateDirty = true;
         q.record.run(`codex:${ownId}:${line}`, file.id, line, rec.type, ts);
         q.compaction.run(`codex:${ownId}:${line}`, file.id, line, session, agent, ts, "auto", null, null, null);
         added = 1;
       }
     } else if (rec.type === "response_item") {
-      if (p.type === "configuration_update" && p.reasoning?.effort) {
-        st.effort = p.reasoning.effort;
+      if (p.type === "configuration_update") {
+        setModel(p.model);
+        setEffort(p.reasoning?.effort ?? p.effort);
       } else if (p.type === "message" && p.role === "user") {
         const msg = userMessageText(p.content);
         if (msg) {
@@ -373,6 +446,10 @@ export function createIngester(db, timeZone) {
         consumeOpenWait();
       } else if (p.type === "function_call" || p.type === "custom_tool_call") {
         consumeOpenWait();
+        if (!st.model && !st.hadUnknownModel) {
+          st.hadUnknownModel = true;
+          st.stateDirty = true;
+        }
         q.record.run(`codex:${ownId}:${line}`, file.id, line, p.type, ts);
         q.call.run(`codex:${p.call_id || `${ownId}:${line}`}`, file.id, line, session, agent, ts, p.name ?? "unknown", st.model ?? null);
         if (tsMs !== null && p.call_id) st.callStart.set(p.call_id, tsMs);
@@ -434,13 +511,18 @@ export function createIngester(db, timeZone) {
       } else if (p.type === "compaction") {
         if (line - st.lastCompactionLine > 5) {
           st.lastCompactionLine = line;
+          st.stateDirty = true;
           q.record.run(`codex:${ownId}:${line}`, file.id, line, p.type, ts);
           q.compaction.run(`codex:${ownId}:${line}`, file.id, line, session, agent, ts, "auto", null, null, null);
           added = 1;
         }
       }
     } else if (rec.type === "event_msg") {
-      if (p.type === "task_started" || p.type === "turn_started") {
+      if (p.type === "thread_settings_applied") {
+        const tsSettings = p.thread_settings;
+        setModel(tsSettings?.model ?? tsSettings?.collaboration_mode?.settings?.model);
+        setEffort(tsSettings?.reasoning_effort ?? tsSettings?.effort ?? tsSettings?.collaboration_mode?.settings?.reasoning_effort);
+      } else if (p.type === "task_started" || p.type === "turn_started") {
         if (tsMs !== null) {
           st.turnStartMs = tsMs;
           st.turnToolMs = 0;
@@ -486,7 +568,10 @@ export function createIngester(db, timeZone) {
               st.fcRemoved += d.removed;
             }
           }
-          st.sawFileChange = true;
+          if (!st.sawFileChange) {
+            st.sawFileChange = true;
+            st.stateDirty = true;
+          }
           st.statsDirty = true;
         }
       } else if (p.type === "token_count" && !st.sawTokenRec && p.info?.last_token_usage) {
@@ -494,7 +579,10 @@ export function createIngester(db, timeZone) {
         const tot = p.info.total_token_usage;
         const totKey = tot ? `${tot.total_tokens}|${tot.input_tokens}|${tot.output_tokens}|${tot.cached_input_tokens}` : null;
         if (!totKey || totKey !== st.lastTotal) {
-          st.lastTotal = totKey;
+          if (st.lastTotal !== totKey) {
+            st.lastTotal = totKey;
+            st.stateDirty = true;
+          }
           if (recordUsage(`codex:${ownId}:${line}`, p.info.last_token_usage)) added = 1;
         }
       }
@@ -518,6 +606,20 @@ export function createIngester(db, timeZone) {
       st.pathsDirty = false;
       const json = st.paths.toJSON();
       if (json) q.upsertTargetPaths.run(fileId, json);
+    }
+    if (st.stateDirty) {
+      st.stateDirty = false;
+      q.upsertParserState.run(fileId, JSON.stringify({
+        cwd: st.cwd,
+        model: st.model,
+        effort: st.effort,
+        sawTokenRec: st.sawTokenRec,
+        lastTotal: st.lastTotal,
+        lastCompactionLine: st.lastCompactionLine,
+        sawFileChange: st.sawFileChange,
+        hadUnknownModel: st.hadUnknownModel,
+        hadNullEffort: st.hadNullEffort,
+      }));
     }
   };
   ingestLine.reset = (fileId) => { stateByFile.delete(fileId); };

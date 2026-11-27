@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 // Bump when the schema changes: the database is then rebuilt from the archive.
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 const SCHEMA = `
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
@@ -43,7 +43,8 @@ CREATE INDEX skills_session ON skills(session_id);
 CREATE INDEX skills_file ON skills(file_id);
 CREATE TABLE subagents(agent_id TEXT PRIMARY KEY, session_id TEXT, type TEXT, tool_use_id TEXT);
 CREATE TABLE file_meta(file_id INTEGER PRIMARY KEY, parent_session_id TEXT, subagent_type TEXT, tool_use_id TEXT,
-  api_ms INTEGER, tool_ms INTEGER, lines_added INTEGER, lines_removed INTEGER, repo_url TEXT, target_paths TEXT);
+  api_ms INTEGER, tool_ms INTEGER, lines_added INTEGER, lines_removed INTEGER, repo_url TEXT, target_paths TEXT,
+  parser_state TEXT);
 CREATE TABLE compactions(uuid TEXT PRIMARY KEY, file_id INTEGER, line INTEGER, session_id TEXT, agent_id TEXT, ts TEXT,
   trigger TEXT, pre_tokens INTEGER, post_tokens INTEGER, duration_ms INTEGER);
 CREATE INDEX compactions_session ON compactions(session_id);
@@ -73,6 +74,8 @@ function configureDb(db) {
 function upgradeInPlace(db) {
   const cols = db.prepare("PRAGMA table_info(files)").all();
   if (!cols.some((c) => c.name === "ctime_ms")) db.exec("ALTER TABLE files ADD COLUMN ctime_ms REAL");
+  const fmCols = db.prepare("PRAGMA table_info(file_meta)").all();
+  if (!fmCols.some((c) => c.name === "parser_state")) db.exec("ALTER TABLE file_meta ADD COLUMN parser_state TEXT");
   db.exec(`
     CREATE INDEX IF NOT EXISTS requests_file ON requests(file_id);
     CREATE INDEX IF NOT EXISTS tool_calls_file ON tool_calls(file_id);
