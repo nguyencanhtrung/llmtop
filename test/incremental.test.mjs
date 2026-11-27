@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -58,10 +58,11 @@ function snapshotDb(dbPath) {
   });
   const snap = {
     sessions: sortBy(db.prepare("SELECT * FROM sessions").all(), "id").map((r) => ({ ...r })),
-    requests: sortBy(db.prepare("SELECT message_id, session_id, agent_id, ts, day, hour, model, family, is_sub, input, output, cache_read, cache_write, rebuild, rebuild_gap, rebuild_extra FROM requests").all(), "message_id").map((r) => ({ ...r })),
+    requests: sortBy(db.prepare("SELECT message_id, session_id, agent_id, ts, day, hour, model, family, effort, is_sub, input, output, thinking, cache_read, cache_write, rebuild, rebuild_gap, rebuild_extra FROM requests").all(), "message_id").map((r) => ({ ...r })),
+    tool_calls: sortBy(db.prepare("SELECT id, session_id, agent_id, ts, name, model, is_error FROM tool_calls").all(), "id").map((r) => ({ ...r })),
     subagents: sortBy(db.prepare("SELECT * FROM subagents").all(), "agent_id").map((r) => ({ ...r })),
     titles: sortBy(db.prepare("SELECT session_id, line, kind, title FROM titles").all(), "session_id", "line", "kind").map((r) => ({ ...r })),
-    file_meta: sortBy(db.prepare("SELECT f.provider, f.path, m.parent_session_id, m.subagent_type, m.api_ms, m.tool_ms, m.lines_added, m.lines_removed, m.repo_url, m.target_paths FROM file_meta m JOIN files f ON f.id = m.file_id").all(), "provider", "path").map((r) => ({ ...r })),
+    file_meta: sortBy(db.prepare("SELECT f.provider, f.path, m.parent_session_id, m.subagent_type, m.api_ms, m.tool_ms, m.lines_added, m.lines_removed, m.repo_url, m.target_paths, m.parser_state FROM file_meta m JOIN files f ON f.id = m.file_id").all(), "provider", "path").map((r) => ({ ...r })),
   };
   db.close();
   return snap;
@@ -83,9 +84,10 @@ test("incremental updates across all providers match a full archive rebuild byte
   writeTranscript(h.claudeDir, "alpha", cFork, [...shared, user("2026-11-10T01:10:00Z", "fork", { cwd: h.repoA }), assistant("2026-11-10T01:10:05Z", "cm2", { input_tokens: 50, output_tokens: 20, cache_creation_input_tokens: 25000 }, { model: "claude-sonnet-5-5", rec: { cwd: h.repoA } }), cost(2.5, { startTime: 1500, modelUsage: { "claude-sonnet-5-5": { costUSD: 2.5, inputTokens: 150, outputTokens: 70, cacheCreationInputTokens: 55000 } } })]);
 
   // Codex subagent lands BEFORE parent exists on disk.
-  writeFileSync(join(h.codexDir, "2026", "11", "10", `rollout-2026-11-10T09-01-00-${xSub}.jsonl`), jsonl([
+  const xSubPath = join(h.codexDir, "2026", "11", "10", `rollout-2026-11-10T09-01-00-${xSub}.jsonl`);
+  writeFileSync(xSubPath, jsonl([
     { timestamp: "2026-11-10T01:01:00Z", type: "session_meta", payload: { id: xSub, parent_thread_id: xParent, source: { subagent: { other: "worker" } }, cwd: h.repoA } },
-    { timestamp: "2026-11-10T01:01:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:01:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", effort: "medium", cwd: h.repoA } },
     { timestamp: "2026-11-10T01:01:02Z", type: "token_usage_record", payload: { response_id: "xr-sub", usage: { input_tokens: 25000, cached_input_tokens: 0, output_tokens: 50 } } },
   ]));
 
@@ -109,11 +111,17 @@ test("incremental updates across all providers match a full archive rebuild byte
   ], { append: true });
 
   // b) Late-arriving Codex parent + session_index title -> promotes xSub from main to sub!
+  //    Also append mid-turn lines to xSub without a new turn_context to verify persisted parser state.
   writeFileSync(join(h.codexHome, "session_index.jsonl"), jsonl([{ id: xParent, thread_name: "Codex Parent Title" }]));
   writeFileSync(join(h.codexDir, "2026", "11", "10", `rollout-2026-11-10T09-00-00-${xParent}.jsonl`), jsonl([
     { timestamp: "2026-11-10T01:00:00Z", type: "session_meta", payload: { id: xParent, cwd: h.repoA } },
-    { timestamp: "2026-11-10T01:00:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:00:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", effort: "high", cwd: h.repoA } },
     { timestamp: "2026-11-10T01:00:02Z", type: "token_usage_record", payload: { response_id: "xr-main", usage: { input_tokens: 25000, cached_input_tokens: 0, output_tokens: 100 } } },
+  ]));
+  appendFileSync(xSubPath, jsonl([
+    { timestamp: "2026-11-10T01:02:00Z", type: "response_item", payload: { type: "function_call", name: "shell", call_id: "call_sub_inc", arguments: "{}" } },
+    { timestamp: "2026-11-10T01:02:01Z", type: "token_usage_record", payload: { response_id: "xr-sub-inc", usage: { input_tokens: 1500, cached_input_tokens: 500, output_tokens: 80, reasoning_output_tokens: 20 } } },
+    { timestamp: "2026-11-10T01:02:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 1500, cached_input_tokens: 500, output_tokens: 80, reasoning_output_tokens: 20 }, total_token_usage: { input_tokens: 26500, cached_input_tokens: 500, output_tokens: 130, total_tokens: 26630 } } } },
   ]));
 
   // c) Deleted worktree path gets recovered once beta becomes a known repo!
@@ -147,6 +155,12 @@ test("incremental updates across all providers match a full archive rebuild byte
 
   const fullSnap = snapshotDb(dbPath);
   const fullDash = buildUsageRows(loadConfig(h.cfg));
+  assert.ok(incSnap.requests.every((r) => r.model !== "unknown"));
+  const incSubReq = incSnap.requests.find((r) => r.message_id === "codex:xr-sub-inc");
+  assert.equal(incSubReq?.model, "gpt-6.2-sol");
+  assert.equal(incSubReq?.effort, "medium");
+  assert.equal(incSnap.tool_calls.find((c) => c.id === "codex:call_sub_inc")?.model, "gpt-6.2-sol");
+  assert.equal(incSnap.requests.filter((r) => r.session_id === xParent).length, 3);
   assert.deepEqual(incSnap, fullSnap);
 
   // Dashboard rows: ignore `scanned` timestamp and SQL rowid ordering of sessions/facts/context.
@@ -174,7 +188,7 @@ test("incremental updates across all providers match a full archive rebuild byte
   assert.deepEqual(normDash(incDash), normDash(fullDash));
 });
 
-test("v13 databases upgrade in place with ctime_ms and file_id indexes, using index plans", () => {
+test("v14 databases upgrade in place with ctime_ms, parser_state, and file_id indexes, using index plans", () => {
   const h = makeMultiHome();
   const s = sid(10);
   writeTranscript(h.claudeDir, "alpha", s, [
@@ -183,7 +197,7 @@ test("v13 databases upgrade in place with ctime_ms and file_id indexes, using in
   ]);
   assert.equal(h.run("scan").code, 0);
 
-  // Drop the new column/indexes? SQLite <3.35/older won't drop column if indexed, so drop indexes first and simulate pre-upgrade files without ctime_ms via temp table copy.
+  // Drop the new columns/indexes via temp table copies to simulate a pre-upgrade DB on the current schema version.
   const dbPath = join(h.dir, "data", "usage.db");
   const db = new DatabaseSync(dbPath);
   for (const idx of ["requests_file", "tool_calls_file", "skills_file", "compactions_file", "owner_messages_file"]) {
@@ -199,19 +213,112 @@ test("v13 databases upgrade in place with ctime_ms and file_id indexes, using in
     DROP TABLE files;
     ALTER TABLE files_old RENAME TO files;
     CREATE INDEX files_session ON files(session_id);
+    CREATE TABLE file_meta_old(file_id INTEGER PRIMARY KEY, parent_session_id TEXT, subagent_type TEXT, tool_use_id TEXT,
+      api_ms INTEGER, tool_ms INTEGER, lines_added INTEGER, lines_removed INTEGER, repo_url TEXT, target_paths TEXT);
+    INSERT INTO file_meta_old(file_id, parent_session_id, subagent_type, tool_use_id, api_ms, tool_ms, lines_added, lines_removed, repo_url, target_paths)
+      SELECT file_id, parent_session_id, subagent_type, tool_use_id, api_ms, tool_ms, lines_added, lines_removed, repo_url, target_paths FROM file_meta;
+    DROP TABLE file_meta;
+    ALTER TABLE file_meta_old RENAME TO file_meta;
   `);
   db.close();
 
-  // Next scan upgrades schema v13 in place without triggering a full archive rebuild.
+  // Next scan upgrades schema v14 in place without triggering a full archive rebuild.
   assert.equal(h.run("scan").code, 0);
 
   const upgraded = new DatabaseSync(dbPath, { readOnly: true });
   assert.ok(upgraded.prepare("PRAGMA table_info(files)").all().some((c) => c.name === "ctime_ms"));
+  assert.ok(upgraded.prepare("PRAGMA table_info(file_meta)").all().some((c) => c.name === "parser_state"));
   for (const table of ["requests", "tool_calls", "skills", "compactions", "owner_messages"]) {
     const plan = upgraded.prepare(`EXPLAIN QUERY PLAN SELECT COUNT(*) FROM ${table} WHERE file_id = ?`).all(1).map((r) => r.detail).join(" ");
     assert.match(plan, /USING (?:COVERING )?INDEX/, `${table} should use index, got: ${plan}`);
   }
   upgraded.close();
+});
+
+test("codex incremental scans preserve switched turn_context state, deduplicate legacy token_count, and reset on rewrite", () => {
+  const h = makeMultiHome();
+  const sidSwitch = "01a2173a-ef3f-7fa1-b51b-ca3045f10011";
+  const sidLegacy = "01a2173b-ef3f-7fa1-b51b-ca3045f10012";
+  const sidRewrite = "01a2173c-ef3f-7fa1-b51b-ca3045f10013";
+
+  const pSwitch = join(h.codexDir, "2026", "11", "10", `rollout-2026-11-10T09-00-00-${sidSwitch}.jsonl`);
+  const pLegacy = join(h.codexDir, "2026", "11", "10", `rollout-2026-11-10T09-05-00-${sidLegacy}.jsonl`);
+  const pRewrite = join(h.codexDir, "2026", "11", "10", `rollout-2026-11-10T09-10-00-${sidRewrite}.jsonl`);
+
+  // a) Scan 1 ends right after a turn_context switch (no request yet for the new model/effort).
+  writeFileSync(pSwitch, jsonl([
+    { timestamp: "2026-11-10T01:00:00Z", type: "session_meta", payload: { id: sidSwitch, cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:00:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", effort: "low", cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:00:02Z", type: "token_usage_record", payload: { response_id: "sw1", usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 50 } } },
+    { timestamp: "2026-11-10T01:01:00Z", type: "turn_context", payload: { model: "gpt-6.1-sol", effort: "xhigh", cwd: h.repoA } },
+  ]));
+
+  // b) Legacy token_count-only file scanned once with total_token_usage.
+  writeFileSync(pLegacy, jsonl([
+    { timestamp: "2026-11-10T01:05:00Z", type: "session_meta", payload: { id: sidLegacy, cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:05:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", effort: "medium", cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:05:02Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 500, cached_input_tokens: 100, output_tokens: 20 }, total_token_usage: { input_tokens: 500, cached_input_tokens: 100, output_tokens: 20, total_tokens: 520 } } } },
+  ]));
+
+  // c) Rewritten file initial state (long enough to change head_hash on rewrite).
+  writeFileSync(pRewrite, jsonl([
+    { timestamp: "2026-11-10T01:10:00Z", type: "session_meta", payload: { id: sidRewrite, cwd: h.repoA, padding: "x".repeat(4200) } },
+    { timestamp: "2026-11-10T01:10:01Z", type: "turn_context", payload: { model: "gpt-6.2-sol", effort: "high", cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:10:02Z", type: "token_usage_record", payload: { response_id: "rw1", usage: { input_tokens: 800, cached_input_tokens: 0, output_tokens: 40 } } },
+  ]));
+
+  assert.equal(h.run("scan").code, 0);
+
+  // Scan 2: append to switched and legacy files, and rewrite pRewrite completely.
+  appendFileSync(pSwitch, jsonl([
+    { timestamp: "2026-11-10T01:01:05Z", type: "response_item", payload: { type: "function_call", name: "shell", call_id: "sw_call_2", arguments: "{}" } },
+    { timestamp: "2026-11-10T01:01:06Z", type: "token_usage_record", payload: { response_id: "sw2", usage: { input_tokens: 2000, cached_input_tokens: 500, output_tokens: 100 } } },
+    { timestamp: "2026-11-10T01:01:06Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 2000, cached_input_tokens: 500, output_tokens: 100 }, total_token_usage: { input_tokens: 3000, cached_input_tokens: 500, output_tokens: 150, total_tokens: 3150 } } } },
+  ]));
+  appendFileSync(pLegacy, jsonl([
+    { timestamp: "2026-11-10T01:05:05Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 500, cached_input_tokens: 100, output_tokens: 20 }, total_token_usage: { input_tokens: 500, cached_input_tokens: 100, output_tokens: 20, total_tokens: 520 } } } },
+  ]));
+  touch(pRewrite, 0);
+  writeFileSync(pRewrite, jsonl([
+    { timestamp: "2026-11-10T01:10:00Z", type: "session_meta", payload: { id: sidRewrite, cwd: h.repoA, padding: "y".repeat(4200) } },
+    { timestamp: "2026-11-10T01:10:01Z", type: "turn_context", payload: { model: "gpt-6-luna", effort: "low", cwd: h.repoA } },
+    { timestamp: "2026-11-10T01:10:02Z", type: "token_usage_record", payload: { response_id: "rw2", usage: { input_tokens: 300, cached_input_tokens: 0, output_tokens: 15 } } },
+  ]));
+  utimesSync(pRewrite, 1700000000, 1700000000);
+
+  const res2 = h.run("scan");
+  assert.equal(res2.code, 0, res2.stderr);
+  assert.match(res2.stdout, /1 rewritten files kept as generations/);
+
+  const dbPath = join(h.dir, "data", "usage.db");
+  const incSnap = snapshotDb(dbPath);
+
+  const swReqs = incSnap.requests.filter((r) => r.session_id === sidSwitch);
+  assert.equal(swReqs.length, 2);
+  assert.equal(swReqs.find((r) => r.message_id === "codex:sw1")?.model, "gpt-6.2-sol");
+  assert.equal(swReqs.find((r) => r.message_id === "codex:sw1")?.effort, "low");
+  assert.equal(swReqs.find((r) => r.message_id === "codex:sw2")?.model, "gpt-6.1-sol");
+  assert.equal(swReqs.find((r) => r.message_id === "codex:sw2")?.effort, "xhigh");
+  assert.equal(incSnap.tool_calls.find((c) => c.id === "codex:sw_call_2")?.model, "gpt-6.1-sol");
+
+  const legReqs = incSnap.requests.filter((r) => r.session_id === sidLegacy);
+  assert.equal(legReqs.length, 1);
+  assert.equal(legReqs[0].model, "gpt-6.2-sol");
+  assert.equal(legReqs[0].effort, "medium");
+
+  const rwReqs = incSnap.requests.filter((r) => r.session_id === sidRewrite);
+  assert.equal(rwReqs.length, 1);
+  assert.equal(rwReqs[0].message_id, "codex:rw2");
+  assert.equal(rwReqs[0].model, "gpt-6-luna");
+  assert.equal(rwReqs[0].effort, "low");
+
+  const db = new DatabaseSync(dbPath);
+  db.exec("UPDATE meta SET value = '0' WHERE key = 'schema'");
+  db.close();
+  assert.equal(h.run("scan").code, 0);
+
+  const fullSnap = snapshotDb(dbPath);
+  assert.deepEqual(incSnap, fullSnap);
 });
 
 test("racy-clean protection catches an immediate same-size rewrite", () => {

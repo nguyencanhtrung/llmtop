@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { loadConfig } from "../src/config.mjs";
 import { buildUsageRows } from "../src/dashboard.mjs";
@@ -271,4 +272,49 @@ test("codex steering session resolves generic/temp clone origin via JS workdir v
   assert.equal(home.run("scan").code, 0);
   const dash = buildUsageRows(loadConfig(home.cfg));
   assert.deepEqual(dash.projects, ["real-app"]);
+});
+
+test("codex backfills early guardian requests and tool calls from thread_settings_applied without overwriting later model switches, and parses object world_state models", () => {
+  const home = makeCodexHome();
+  const repo = join(home.dir, "work", "zeta");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  const gId = "01a21730-ef3f-7fa1-b51b-ca3045f10004";
+  const wsId = "01a21731-ef3f-7fa1-b51b-ca3045f10005";
+
+  writeFileSync(join(home.sessions, "2026", "11", "10", `rollout-2026-11-10T09-20-00-${gId}.jsonl`), jsonl([
+    { timestamp: "2026-11-10T01:20:00Z", type: "session_meta", payload: { id: gId, source: { subagent: { other: "guardian" } }, cwd: repo } },
+    { timestamp: "2026-11-10T01:20:01Z", type: "response_item", payload: { type: "function_call", name: "shell", call_id: "g_call_1", arguments: "{}" } },
+    { timestamp: "2026-11-10T01:20:02Z", type: "token_usage_record", payload: { response_id: "g_r1", usage: { input_tokens: 1000, cached_input_tokens: 200, output_tokens: 50 } } },
+    { timestamp: "2026-11-10T01:20:03Z", type: "compacted", payload: { message: "" } },
+    { timestamp: "2026-11-10T01:20:04Z", type: "event_msg", payload: { type: "thread_settings_applied", thread_settings: { model: "codex-auto-review", reasoning_effort: "low" } } },
+    { timestamp: "2026-11-10T01:20:05Z", type: "world_state", payload: { state: { model: "codex-auto-review" } } },
+    { timestamp: "2026-11-10T01:21:00Z", type: "turn_context", payload: { model: "gpt-6.2-sol", effort: "high", cwd: repo } },
+    { timestamp: "2026-11-10T01:21:01Z", type: "token_usage_record", payload: { response_id: "g_r2", usage: { input_tokens: 400, cached_input_tokens: 0, output_tokens: 20 } } },
+  ]));
+
+  writeFileSync(join(home.sessions, "2026", "11", "10", `rollout-2026-11-10T09-25-00-${wsId}.jsonl`), jsonl([
+    { timestamp: "2026-11-10T01:25:00Z", type: "session_meta", payload: { id: wsId, cwd: repo } },
+    { timestamp: "2026-11-10T01:25:01Z", type: "world_state", payload: { state: { model: { model: "gpt-5.6-luna", instructions: "hash" }, collaboration_mode: { mode: "default", model: "gpt-5.6-luna" } } } },
+    { timestamp: "2026-11-10T01:25:02Z", type: "token_usage_record", payload: { response_id: "ws_r1", usage: { input_tokens: 600, cached_input_tokens: 100, output_tokens: 30 } } },
+  ]));
+
+  const scanRes = home.run("scan");
+  assert.equal(scanRes.code, 0, scanRes.stderr);
+
+  const db = new DatabaseSync(join(home.dir, "data", "usage.db"), { readOnly: true });
+  const reqs = Object.fromEntries(db.prepare("SELECT message_id, model, family, effort FROM requests").all().map((r) => [r.message_id, r]));
+  const call = db.prepare("SELECT model FROM tool_calls WHERE id = ?").get("codex:g_call_1");
+  db.close();
+
+  assert.equal(reqs["codex:g_r1"].model, "codex-auto-review");
+  assert.equal(reqs["codex:g_r1"].family, "codex-auto-review");
+  assert.equal(reqs["codex:g_r1"].effort, "low");
+  assert.equal(call.model, "codex-auto-review");
+
+  assert.equal(reqs["codex:g_r2"].model, "gpt-6.2-sol");
+  assert.equal(reqs["codex:g_r2"].family, "sol");
+  assert.equal(reqs["codex:g_r2"].effort, "high");
+
+  assert.equal(reqs["codex:ws_r1"].model, "gpt-5.6-luna");
+  assert.equal(reqs["codex:ws_r1"].family, "luna");
 });
