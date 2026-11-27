@@ -292,6 +292,7 @@ test("uninstallCommand --yes --purge removes default ~/.config/llmtop directory 
     deps: {
       env,
       home: dir,
+      findRunningServers: () => ({ servers: [], staleState: false }),
       detectInstallMode: () => ({ mode: "local", packageManager: null, root: "/tmp/local-llmtop-repo" }),
       hasGlobalPackage: () => false,
     },

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { defaultConfigDir, defaultConfigPath, loadConfig, ROOT } from "../src/config.mjs";
 import { localTime } from "../src/format.mjs";
 import { pricesCommand } from "../src/prices-command.mjs";
-import { stopCommand, writeServerState } from "../src/process.mjs";
+import { startCommand, stopCommand, writeServerState } from "../src/process.mjs";
 import { scan, scanReport } from "../src/scan.mjs";
 import { serve } from "../src/serve.mjs";
 import { show } from "../src/show.mjs";
@@ -21,7 +21,8 @@ const USAGE = `usage: llmtop <command> [options]
   usage [--days n | --since d --until d] [--by day|model|provider|effort|project|session|hour|tool|skill|subagent]
         [--provider name] [--project name] [--model family] [--effort level]
   prices                                the price table checked against the host's cost records
-  serve [--port n]                      the built dashboard on http://localhost:<port>
+  serve [--port n] [--daemon]           the built dashboard on http://localhost:<port>
+  start [--port n]                      start the dashboard in the background
   stop                                  stop the running llmtop serve process
   update [--check] [--force]            check npmjs or upgrade llmtop to the latest version
   uninstall [--purge] [--dry-run] [--yes]
@@ -46,6 +47,14 @@ function loadConfigOrDefault() {
   }
 }
 
+function parsePort(options, config) {
+  const port = options.port === undefined ? config.port : Number(options.port);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new UsageError(`--port needs a port number, got ${options.port}`);
+  }
+  return port;
+}
+
 const COMMANDS = {
   async scan({ config, out }) {
     const t = await scan(config);
@@ -57,11 +66,22 @@ const COMMANDS = {
   },
   usage: usageCommand,
   async serve({ config, options, out }) {
-    const port = options.port === undefined ? config.port : Number(options.port);
-    if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError(`--port needs a port number, got ${options.port}`);
+    const port = parsePort(options, config);
+    if (options.daemon) {
+      return startCommand({ config, options: { ...options, port }, out });
+    }
+    if (process.env.LLMTOP_DAEMON === "1") {
+      process.on("SIGHUP", () => {});
+    }
     const at = localTime(config.timeZone);
     const server = await serve(config, { port, onScan: (t) => reportScan(t, out, `${at(new Date().toISOString())}  `) });
-    const cleanup = writeServerState(config, { pid: process.pid, port: server.address().port, version: VERSION });
+    const cleanup = writeServerState(config, {
+      pid: process.pid,
+      port: server.address().port,
+      version: VERSION,
+      token: process.env.LLMTOP_DAEMON_TOKEN,
+      daemon: process.env.LLMTOP_DAEMON === "1",
+    });
     server.once("close", cleanup);
     let closing = false;
     const shutdown = () => {
@@ -75,6 +95,10 @@ const COMMANDS = {
     process.once("SIGTERM", shutdown);
     out.write(`dashboard at http://localhost:${server.address().port}: its Refresh button scans again, Ctrl+C to stop\n`);
   },
+  async start({ config, options, out }) {
+    const port = parsePort(options, config);
+    return startCommand({ config, options: { ...options, port }, out });
+  },
   prices: pricesCommand,
   stop: stopCommand,
   update: updateCommand,
@@ -82,7 +106,7 @@ const COMMANDS = {
 };
 
 // Options are --name value or --flag; FLAGS lists the ones without a value.
-const FLAGS = new Set(["json", "check", "force", "purge", "dry-run", "yes"]);
+const FLAGS = new Set(["json", "check", "force", "purge", "dry-run", "yes", "daemon"]);
 const LENIENT_CONFIG_COMMANDS = new Set(["stop", "update", "uninstall"]);
 function parseArgs(argv) {
   const positional = [];
@@ -91,6 +115,10 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "-y") {
       options.yes = true;
+      continue;
+    }
+    if (arg === "-d") {
+      options.daemon = true;
       continue;
     }
     if (!arg.startsWith("--")) {

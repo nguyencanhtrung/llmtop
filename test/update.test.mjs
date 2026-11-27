@@ -203,3 +203,82 @@ test("updateCommand reports permission errors with sudo hint and handles unreach
     /failed to reach npm registry/,
   );
 });
+
+test("updateCommand stops background daemon before upgrade and restarts it on the new version", async () => {
+  const home = makeHome();
+  const out = bufferStream();
+  const err = bufferStream();
+  const order = [];
+  let restartedPort = null;
+
+  const code = await updateCommand({
+    config: { data: home.data },
+    options: {},
+    out,
+    err,
+    deps: {
+      currentVersion: "0.1.3",
+      detectInstallMode: () => ({ mode: "global", packageManager: "npm", root: "/usr/lib/node_modules/llmtop" }),
+      fetchLatestVersion: async () => "0.1.4",
+      findRunningServers: () => ({ servers: [{ pid: 7777, port: 4310, source: "state", daemon: true }], staleState: false }),
+      stopRunningServers: async () => {
+        order.push("stop");
+        return { stopped: [{ pid: 7777, port: 4310 }], failed: [], cleanedState: true };
+      },
+      runPackageManager: () => {
+        order.push("install");
+        return { ok: true, code: 0, stdout: "", stderr: "", error: "", command: "npm install -g llmtop@0.1.4", permissionDenied: false };
+      },
+      restartDaemon: ({ port }) => {
+        order.push("restart");
+        restartedPort = port;
+        return { ok: true, stdout: "dashboard at http://localhost:4310 in the background (pid 8888)\n", stderr: "", error: "" };
+      },
+    },
+  });
+
+  assert.equal(code, 0);
+  assert.equal(err.toString(), "");
+  assert.deepEqual(order, ["stop", "install", "restart"]);
+  assert.equal(restartedPort, 4310);
+  assert.match(out.toString(), /stopped background llmtop serve before upgrade \(pid 7777\)/);
+  assert.match(out.toString(), /updated llmtop 0\.1\.3 -> 0\.1\.4/);
+  assert.match(out.toString(), /pid 8888/);
+});
+
+test("updateCommand restores stopped background daemon when package upgrade fails", async () => {
+  const home = makeHome();
+  const out = bufferStream();
+  const err = bufferStream();
+  const order = [];
+
+  const code = await updateCommand({
+    config: { data: home.data },
+    options: {},
+    out,
+    err,
+    deps: {
+      currentVersion: "0.1.3",
+      detectInstallMode: () => ({ mode: "global", packageManager: "npm", root: "/usr/lib/node_modules/llmtop" }),
+      fetchLatestVersion: async () => "0.1.4",
+      findRunningServers: () => ({ servers: [{ pid: 7777, port: 4310, source: "state", daemon: true }], staleState: false }),
+      stopRunningServers: async () => {
+        order.push("stop");
+        return { stopped: [{ pid: 7777, port: 4310 }], failed: [], cleanedState: true };
+      },
+      runPackageManager: () => {
+        order.push("install");
+        return { ok: false, code: 1, stdout: "", stderr: "network error", error: "", command: "npm install -g llmtop@0.1.4", permissionDenied: false };
+      },
+      restartDaemon: () => {
+        order.push("restart");
+        return { ok: true, stdout: "dashboard at http://localhost:4310 in the background (pid 7778)\n", stderr: "", error: "" };
+      },
+    },
+  });
+
+  assert.equal(code, 1);
+  assert.deepEqual(order, ["stop", "install", "restart"]);
+  assert.match(err.toString(), /update failed/);
+  assert.match(out.toString(), /pid 7778/);
+});
