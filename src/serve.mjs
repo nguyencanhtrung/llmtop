@@ -23,18 +23,28 @@ const TEXT = { "content-type": "text/plain; charset=utf-8" };
 export function serve(config, { port, onScan = () => {}, dist = DIST, routes }) {
   const api = createApi(config, { onScan, routes });
   const server = createServer(async (req, res) => {
-    if (await api(req, res)) return;
-    if (req.method !== "GET") return res.writeHead(405, TEXT).end("method not allowed\n");
-    const path = normalize(decodeURIComponent(new URL(req.url, "http://localhost").pathname));
-    const file = join(dist, path);
-    const asset = file.startsWith(dist + sep) && extname(path) ? file : join(dist, "index.html");
     try {
-      const body = await readFile(asset);
-      const cacheControl = asset.startsWith(join(dist, "assets") + sep) ? "max-age=31536000, immutable" : "no-store";
-      res.writeHead(200, { "content-type": TYPES[extname(asset)] ?? "application/octet-stream", "cache-control": cacheControl }).end(body);
+      if (await api(req, res)) return;
+      if (req.method !== "GET") return res.writeHead(405, TEXT).end("method not allowed\n");
+      let path;
+      try {
+        path = normalize(decodeURIComponent(new URL(req.url, "http://localhost").pathname));
+      } catch {
+        return res.writeHead(400, TEXT).end("bad request\n");
+      }
+      const file = join(dist, path);
+      const asset = file.startsWith(dist + sep) && extname(path) ? file : join(dist, "index.html");
+      try {
+        const body = await readFile(asset);
+        const cacheControl = asset.startsWith(join(dist, "assets") + sep) ? "max-age=31536000, immutable" : "no-store";
+        res.writeHead(200, { "content-type": TYPES[extname(asset)] ?? "application/octet-stream", "cache-control": cacheControl }).end(body);
+      } catch {
+        if (asset.endsWith("index.html")) res.writeHead(503, TEXT).end("the dashboard is not built: run npm run build, or npm run dev\n");
+        else res.writeHead(404, TEXT).end("not found\n");
+      }
     } catch {
-      if (asset.endsWith("index.html")) res.writeHead(503, TEXT).end("the dashboard is not built: run npm run build, or npm run dev\n");
-      else res.writeHead(404, TEXT).end("not found\n");
+      if (!res.headersSent) res.writeHead(500, TEXT).end("internal server error\n");
+      else if (!res.writableEnded) res.end();
     }
   });
   return new Promise((resolve, reject) => {

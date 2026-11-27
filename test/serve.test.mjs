@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -131,6 +132,36 @@ test("extra routes run through the same queue as the built-in ones", async () =>
     const data = await fetch(`${url}/api/data`).then((r) => r.json());
     assert.ok(Array.isArray(data.facts));
     assert.equal((await fetch(`${url}/api/extra`, { method: "POST" })).status, 404);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("serve returns 400 for malformed URLs without crashing", async () => {
+  const home = makeHome();
+  const server = await serve(loadConfig(home.config), { port: 0, dist: fakeDist() });
+  const port = server.address().port;
+  const url = `http://127.0.0.1:${port}`;
+  const rawGet = (path) => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: "127.0.0.1", port, path, method: "GET" }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+  try {
+    for (const badPath of ["/%E0%A4%A", "/%ZZ", "//[invalid"]) {
+      const res = await rawGet(badPath);
+      assert.equal(res.status, 400, badPath);
+      assert.equal(res.body, "bad request\n", badPath);
+    }
+    const ok = await fetch(`${url}/`);
+    assert.equal(ok.status, 200);
+    assert.match(await ok.text(), /<title>app<\/title>/);
   } finally {
     server.closeAllConnections();
     server.close();

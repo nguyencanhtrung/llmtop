@@ -28,7 +28,12 @@ export function createApi(config, { onScan = () => {}, routes: extra = {} } = {}
     },
   };
   return (req, res) => {
-    const path = new URL(req.url, "http://localhost").pathname;
+    let path;
+    try {
+      path = new URL(req.url, "http://localhost").pathname;
+    } catch {
+      return Promise.resolve(false);
+    }
     if (!path.startsWith("/api/")) return Promise.resolve(false);
     if (req.method === "GET" && path === "/api/scan/progress") {
       res.writeHead(200, JSON_TYPE).end(JSON.stringify(progress));
