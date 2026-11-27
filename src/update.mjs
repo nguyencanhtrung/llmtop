@@ -1,8 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT } from "./config.mjs";
 import { detectInstallMode, runPackageManager } from "./install.mjs";
-import { findRunningServers } from "./process.mjs";
+import { findRunningServers, stopRunningServers } from "./process.mjs";
 
 const VERSION = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version;
 
@@ -80,6 +81,20 @@ export async function fetchLatestVersion({
   return data.version.trim();
 }
 
+export function restartInstalledDaemon({ port, env = process.env, platform = process.platform, spawn = spawnSync } = {}) {
+  const args = ["start", ...(port ? ["--port", String(port)] : [])];
+  let res = spawn("llmtop", args, { encoding: "utf8", stdio: "pipe", env, shell: platform === "win32" });
+  if (res.error?.code === "ENOENT") {
+    res = spawn(process.execPath, [join(ROOT, "bin", "llmtop.mjs"), ...args], { encoding: "utf8", stdio: "pipe", env });
+  }
+  return {
+    ok: !res.error && res.status === 0,
+    stdout: res.stdout ?? "",
+    stderr: res.stderr ?? "",
+    error: res.error?.message ?? "",
+  };
+}
+
 export async function updateCommand({ config, options = {}, out, err = process.stderr, deps = {} }) {
   const current = deps.currentVersion ?? VERSION;
   const env = deps.env ?? process.env;
@@ -120,6 +135,27 @@ export async function updateCommand({ config, options = {}, out, err = process.s
     }
   }
 
+  const findServers = deps.findRunningServers ?? findRunningServers;
+  const stopServers = deps.stopRunningServers ?? stopRunningServers;
+  const restartDaemon = deps.restartDaemon ?? restartInstalledDaemon;
+
+  const before = findServers(config);
+  const daemons = before.servers.filter((s) => s.daemon);
+  let restartPort;
+
+  if (daemons.length > 0) {
+    restartPort = daemons[0].port;
+    const stopped = await stopServers(config);
+    if (stopped.failed.length > 0) {
+      for (const f of stopped.failed) {
+        err.write(`error: could not stop background llmtop serve (pid ${f.pid}) before upgrade: ${f.error}\n`);
+      }
+      return 1;
+    }
+    const details = stopped.stopped.map((s) => `pid ${s.pid}`).join(", ");
+    out.write(`stopped background llmtop serve before upgrade (${details})\n`);
+  }
+
   const pm = install.packageManager || "npm";
   const res = (deps.runPackageManager ?? runPackageManager)(pm, "install", `llmtop@${latest}`);
   if (!res.ok) {
@@ -127,14 +163,32 @@ export async function updateCommand({ config, options = {}, out, err = process.s
     if (res.permissionDenied) {
       err.write(`hint: try running \`sudo ${res.command}\`\n`);
     }
+    if (daemons.length > 0) {
+      const restored = restartDaemon({ port: restartPort, env });
+      if (restored.ok) {
+        out.write(`${restored.stdout.trim() || "restarted previous background llmtop serve"}\n`);
+      } else {
+        err.write(`warning: failed to restore background server: ${restored.stderr.trim() || restored.error}; run \`llmtop start\` manually\n`);
+      }
+    }
     return 1;
   }
 
   out.write(`updated llmtop ${current} -> ${latest}\n`);
-  const { servers } = (deps.findRunningServers ?? findRunningServers)(config);
-  if (servers.length > 0) {
-    const details = servers.map((s) => `pid ${s.pid}${s.port ? ` on port ${s.port}` : ""}`).join(", ");
-    out.write(`note: llmtop serve is still running (${details}); run \`llmtop stop\` and \`llmtop serve\` to use ${latest}.\n`);
+  if (daemons.length > 0) {
+    const restarted = restartDaemon({ port: restartPort, env });
+    if (restarted.ok) {
+      out.write(`${restarted.stdout.trim() || "restarted background llmtop serve"}\n`);
+    } else {
+      err.write(`warning: updated to ${latest} but failed to restart background server: ${restarted.stderr.trim() || restarted.error}; run \`llmtop start\` manually\n`);
+      return 1;
+    }
+  } else {
+    const { servers } = findServers(config);
+    if (servers.length > 0) {
+      const details = servers.map((s) => `pid ${s.pid}${s.port ? ` on port ${s.port}` : ""}`).join(", ");
+      out.write(`note: llmtop serve is still running (${details}); run \`llmtop stop\` and \`llmtop start\` (or \`llmtop serve\`) to use ${latest}.\n`);
+    }
   }
   return 0;
 }

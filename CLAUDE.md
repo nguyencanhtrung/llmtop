@@ -20,9 +20,9 @@ Run `make test` and `make check` after every change; `make build` when the dashb
 
 | Path | Holds |
 | --- | --- |
-| `bin/llmtop.mjs` | CLI entry: scan, show, usage, prices, serve, stop, update, uninstall |
+| `bin/llmtop.mjs` | CLI entry: scan, show, usage, prices, serve, start, stop, update, uninstall |
 | `src/config.mjs` | Optional config (`~/.config/llmtop/config.json` by default, or `./llmtop.config.json` if present locally) and defaults (`~/.config/llmtop/data/`); unknown keys pass through |
-| `src/process.mjs`, `src/install.mjs`, `src/update.mjs`, `src/uninstall.mjs` | Server runtime state (`serve.json`) and `stop`, install-mode detection, explicit npmjs `update`, and `uninstall` |
+| `src/process.mjs`, `src/install.mjs`, `src/update.mjs`, `src/uninstall.mjs` | Server runtime state (`serve.json`, `serve.log`), background `start`/`stop`, install-mode detection, explicit npmjs `update`, and `uninstall` |
 | `src/providers/` | One module per transcript source (`claude.mjs`, `codex.mjs`, `agy.mjs`); `index.mjs` lists them |
 | `src/archive.mjs`, `src/scan.mjs` | Append-only copy of each provider's transcripts under `data/archive/<provider>/`, then ingest |
 | `src/db.mjs` | Schema of `data/usage.db`; bump `SCHEMA_VERSION` on any change and the database is rebuilt from the archive |

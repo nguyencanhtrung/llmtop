@@ -1,18 +1,24 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { ROOT } from "./config.mjs";
+import { spawn, spawnSync } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { defaultConfigDir, ROOT } from "./config.mjs";
 
 export function serverStatePath(config) {
   return join(config.data, "serve.json");
 }
 
+export function serverLogPath(config) {
+  return join(config.data, "serve.log");
+}
+
 // Writes serve.json atomically and returns a cleanup callback that removes it only if the PID still matches.
-export function writeServerState(config, { pid = process.pid, port, version }) {
+export function writeServerState(config, { pid = process.pid, port, version, token, daemon = false }) {
   const path = serverStatePath(config);
   mkdirSync(config.data, { recursive: true });
   const tmp = join(config.data, `.serve.${pid}.${process.hrtime.bigint()}.tmp`);
-  const payload = JSON.stringify({ pid, port, startedAt: new Date().toISOString(), version }, null, 2);
+  const body = { pid, port, startedAt: new Date().toISOString(), version, daemon: Boolean(daemon) };
+  if (token !== undefined) body.token = token;
+  const payload = JSON.stringify(body, null, 2);
   writeFileSync(tmp, `${payload}\n`);
   renameSync(tmp, path);
   return () => {
@@ -88,16 +94,44 @@ function parsePortFromCommand(command) {
   return match ? Number(match[1]) : null;
 }
 
+function readProcEnv(pid, readFile = readFileSync) {
+  try {
+    const raw = readFile(`/proc/${pid}/environ`, "utf8");
+    const env = {};
+    for (const entry of raw.split("\0")) {
+      const idx = entry.indexOf("=");
+      if (idx > 0) env[entry.slice(0, idx)] = entry.slice(idx + 1);
+    }
+    return env;
+  } catch {
+    return null;
+  }
+}
+
+function belongsToConfig(pid, config, env, readFile) {
+  const procEnv = readProcEnv(pid, readFile);
+  if (!procEnv) return true;
+  if (procEnv.LLMTOP_DATA && resolve(procEnv.LLMTOP_DATA) !== resolve(config.data)) return false;
+  if (procEnv.LLMTOP_CONFIG && config.configPath && resolve(procEnv.LLMTOP_CONFIG) !== resolve(config.configPath)) return false;
+  if (procEnv.XDG_CONFIG_HOME !== env.XDG_CONFIG_HOME) return false;
+  return true;
+}
+
 export function findRunningServers(config, deps = {}) {
   const {
-    listProcesses = listOsProcesses,
+    listProcesses,
     isAlive = isPidAlive,
     selfPid = process.pid,
     root = ROOT,
+    env = process.env,
     exists = existsSync,
     readFile = readFileSync,
   } = deps;
-  const osList = listProcesses();
+  const defaultDataDir = resolve(join(defaultConfigDir(env), "data"));
+  const isDefaultData = resolve(config.data) === defaultDataDir;
+  const isRepoData = resolve(config.data) === resolve(join(root, "data"));
+  const scanProcesses = deps.includeProcessScan ?? (Boolean(listProcesses) || isDefaultData);
+  const osList = (listProcesses ?? listOsProcesses)();
   const osByPid = new Map(osList.map((p) => [p.pid, p]));
   const byPid = new Map();
   let staleState = false;
@@ -110,7 +144,7 @@ export function findRunningServers(config, deps = {}) {
         const osEntry = osByPid.get(state.pid);
         const matchesOs = osList.length === 0 || (osEntry && isLlmtopServeCommand(osEntry.command));
         if (isAlive(state.pid) && matchesOs) {
-          byPid.set(state.pid, { pid: state.pid, port: state.port ?? null, source: "state" });
+          byPid.set(state.pid, { pid: state.pid, port: state.port ?? null, source: "state", daemon: Boolean(state.daemon) });
         } else {
           staleState = true;
         }
@@ -121,7 +155,7 @@ export function findRunningServers(config, deps = {}) {
   }
 
   const pidFile = join(root, "data", "serve.pid");
-  if (exists(pidFile)) {
+  if (isRepoData && exists(pidFile)) {
     try {
       const pid = Number(readFile(pidFile, "utf8").trim());
       if (Number.isInteger(pid) && pid > 0 && pid !== selfPid && isAlive(pid)) {
@@ -129,7 +163,7 @@ export function findRunningServers(config, deps = {}) {
         if (osEntry && isLlmtopServeCommand(osEntry.command)) {
           const existing = byPid.get(pid);
           if (existing) existing.pidFile = pidFile;
-          else byPid.set(pid, { pid, port: parsePortFromCommand(osEntry.command), source: "pidfile", pidFile });
+          else byPid.set(pid, { pid, port: parsePortFromCommand(osEntry.command), source: "pidfile", pidFile, daemon: false });
         }
       }
     } catch {
@@ -137,9 +171,12 @@ export function findRunningServers(config, deps = {}) {
     }
   }
 
-  for (const proc of osList) {
-    if (proc.pid === selfPid || byPid.has(proc.pid) || !isLlmtopServeCommand(proc.command)) continue;
-    byPid.set(proc.pid, { pid: proc.pid, port: parsePortFromCommand(proc.command), source: "process" });
+  if (scanProcesses) {
+    for (const proc of osList) {
+      if (proc.pid === selfPid || byPid.has(proc.pid) || !isLlmtopServeCommand(proc.command)) continue;
+      if (!listProcesses && !belongsToConfig(proc.pid, config, env, readFile)) continue;
+      byPid.set(proc.pid, { pid: proc.pid, port: parsePortFromCommand(proc.command), source: "process", daemon: false });
+    }
   }
 
   return { servers: [...byPid.values()].sort((a, b) => a.pid - b.pid), staleState };
@@ -233,5 +270,159 @@ export async function stopCommand({ config, out, err = process.stderr, deps = {}
   for (const s of stopped) {
     out.write(`stopped llmtop serve (pid ${s.pid}${s.port ? `, port ${s.port}` : ""})\n`);
   }
+  return 0;
+}
+
+const FORWARDED_DAEMON_ENV = [
+  "HOME",
+  "PATH",
+  "USER",
+  "TZ",
+  "XDG_CONFIG_HOME",
+  "LLMTOP_CONFIG",
+  "LLMTOP_DATA",
+  "NODE_OPTIONS",
+];
+
+export function canUseSystemdUser({ platform = process.platform, spawn: spawnCmd = spawnSync, env = process.env } = {}) {
+  if (platform !== "linux" || env.LLMTOP_NO_SYSTEMD === "1") return false;
+  try {
+    const version = spawnCmd("systemd-run", ["--version"], { encoding: "utf8", stdio: "pipe" });
+    if (version.status !== 0) return false;
+    const mgr = spawnCmd("systemctl", ["--user", "show-environment"], { encoding: "utf8", stdio: "pipe" });
+    return mgr.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function readAppendedLog(logPath, startOffset, exists, readFile) {
+  if (!exists(logPath)) return "";
+  try {
+    const buf = readFile(logPath);
+    return buf.subarray(startOffset).toString("utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+export async function startBackgroundServer(config, { port, deps = {} } = {}) {
+  const {
+    env = process.env,
+    platform = process.platform,
+    root = ROOT,
+    binPath = join(ROOT, "bin", "llmtop.mjs"),
+    execPath = process.execPath,
+    spawn: spawnChild = spawn,
+    spawnSync: spawnCmd = spawnSync,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    timeoutMs = 5000,
+    isAlive = isPidAlive,
+    exists = existsSync,
+    readFile = readFileSync,
+    stat = statSync,
+    mkdir = mkdirSync,
+    unlink = unlinkSync,
+    open = openSync,
+    close = closeSync,
+    canUseSystemd = canUseSystemdUser,
+  } = deps;
+
+  const { servers, staleState } = findRunningServers(config, { ...deps, root, isAlive, exists, readFile });
+  if (servers.length > 0) {
+    return { ok: false, alreadyRunning: true, server: servers[0] };
+  }
+  if (staleState) {
+    try {
+      unlink(serverStatePath(config));
+    } catch {
+      // Ignore already-deleted stale state file.
+    }
+  }
+
+  mkdir(config.data, { recursive: true });
+  const logPath = serverLogPath(config);
+  const startOffset = exists(logPath) ? stat(logPath).size : 0;
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const childArgs = [binPath, "serve", ...(port !== undefined ? ["--port", String(port)] : [])];
+
+  let mode = null;
+  let unit = null;
+  let child = null;
+
+  if (canUseSystemd({ platform, spawn: spawnCmd, env })) {
+    unit = `llmtop-serve-${Date.now()}-${process.pid}`;
+    const setenvArgs = [];
+    for (const key of FORWARDED_DAEMON_ENV) {
+      if (env[key] !== undefined) setenvArgs.push(`--setenv=${key}=${env[key]}`);
+    }
+    setenvArgs.push("--setenv=LLMTOP_DAEMON=1", `--setenv=LLMTOP_DAEMON_TOKEN=${token}`);
+    const systemdArgs = [
+      "--user",
+      "--collect",
+      "--no-block",
+      `--unit=${unit}`,
+      "--description=llmtop local dashboard",
+      `--property=WorkingDirectory=${config.data}`,
+      `--property=StandardOutput=append:${logPath}`,
+      `--property=StandardError=append:${logPath}`,
+      ...setenvArgs,
+      execPath,
+      ...childArgs,
+    ];
+    const res = spawnCmd("systemd-run", systemdArgs, { encoding: "utf8", stdio: "pipe" });
+    if (res.status === 0) mode = "systemd";
+    else unit = null;
+  }
+
+  if (!mode) {
+    const logFd = open(logPath, "a");
+    try {
+      child = spawnChild(execPath, childArgs, {
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        env: { ...env, LLMTOP_DAEMON: "1", LLMTOP_DAEMON_TOKEN: token },
+      });
+    } finally {
+      close(logFd);
+    }
+    child.unref();
+    mode = "detached";
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = readServerState(config, { exists, readFile });
+    if (state && state.token === token && isAlive(state.pid)) {
+      return { ok: true, pid: state.pid, port: state.port, logPath, mode, unit };
+    }
+    if (mode === "detached" && child?.exitCode !== null) break;
+    if (mode === "systemd") {
+      const appended = readAppendedLog(logPath, startOffset, exists, readFile);
+      if (/^error:/m.test(appended)) break;
+    }
+    await sleep(50);
+  }
+
+  const appended = readAppendedLog(logPath, startOffset, exists, readFile);
+  return {
+    ok: false,
+    error: appended || "timed out waiting for llmtop serve to start",
+    logPath,
+  };
+}
+
+export async function startCommand({ config, options = {}, out, err = process.stderr, deps = {} }) {
+  const res = await startBackgroundServer(config, { port: options.port, deps });
+  if (res.alreadyRunning) {
+    const where = res.server.port ? `, http://localhost:${res.server.port}` : "";
+    err.write(`llmtop serve is already running (pid ${res.server.pid}${where}); run \`llmtop stop\` first\n`);
+    return 1;
+  }
+  if (!res.ok) {
+    err.write(`${res.error}\n`);
+    return 1;
+  }
+  out.write(`dashboard at http://localhost:${res.port} in the background (pid ${res.pid}, log ${res.logPath}); run \`llmtop stop\` to stop\n`);
   return 0;
 }

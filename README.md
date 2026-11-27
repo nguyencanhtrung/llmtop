@@ -24,10 +24,10 @@
 
 ```bash
 npm install -g llmtop
-llmtop serve
+llmtop start        # Run in background (survives closing the terminal); llmtop stop to end
 ```
 
-Or run without installing: `npx llmtop serve`. Open <http://localhost:4310>.
+Or run in the foreground with `llmtop serve`, or without installing via `npx llmtop serve`. Open <http://localhost:4310>.
 
 - **Local-only:** Binds `127.0.0.1` only; zero telemetry, zero background network requests (only `llmtop update` contacts npmjs when invoked), zero runtime npm dependencies.
 - **Zero setup:** Automatically reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.gemini/antigravity-cli`, skipping absent tools.
@@ -90,7 +90,8 @@ Or run without installing: `npx llmtop serve`. Open <http://localhost:4310>.
 CLI and dashboard totals stay identical for the same window and filters (`--json` supported on listing commands).
 
 ```bash
-llmtop serve [--port n]                   # Dashboard at http://localhost:4310
+llmtop start [--port n]                   # Start dashboard in background (log ~/.config/llmtop/data/serve.log)
+llmtop serve [--port n] [--daemon]        # Dashboard at http://localhost:4310 (--daemon detaches like start)
 llmtop stop                               # Stop the running dashboard server
 llmtop scan                               # Archive new transcript lines into usage.db
 llmtop usage [--days n | --since d --until d] [--by day|model|provider|effort|project|session|hour|tool|skill|subagent]
@@ -114,7 +115,8 @@ llmtop uninstall               # Stop llmtop and remove the global package (keep
 llmtop uninstall --purge       # Also remove ~/.config/llmtop (config, archive, and usage.db)
 ```
 
-- **`llmtop update`** queries `registry.npmjs.org` only when invoked (never in the background), detects your global package manager (`npm`, `pnpm`, `yarn`, or `bun`), and warns if `llmtop serve` is running so you can restart it afterward. From a local Git checkout or `npx`, it prints manual steps unless `--force` is passed.
+- **`llmtop start`** (or `llmtop serve --daemon`) detaches the dashboard from the terminal and writes logs to `~/.config/llmtop/data/serve.log` (using `systemd-run --user` on systemd Linux so closing the terminal will not stop it). Run `llmtop stop` to end it.
+- **`llmtop update`** queries `registry.npmjs.org` only when invoked (never in the background), detects your global package manager (`npm`, `pnpm`, `yarn`, or `bun`), automatically stops a running background daemon (`llmtop start` / `--daemon`) before upgrading and restarts it on the new version, and warns if a foreground `llmtop serve` is running so you can restart it afterward. From a local Git checkout or `npx`, it prints manual steps unless `--force` is passed.
 - **`llmtop uninstall`** stops running `llmtop serve` processes, removes the global package, and asks for confirmation in interactive terminals (pass `--yes` or `-y` in scripts). By default it keeps `~/.config/llmtop`; add `--purge` to delete local config, archive, and SQLite data. Original provider transcripts (`~/.claude`, `~/.codex`, `~/.gemini/antigravity-cli`) are never touched.
 
 ## Configuration
